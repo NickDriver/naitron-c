@@ -5,11 +5,23 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P5** — orchestrator with supervision + SQLite registry. Services and
-> routes live in a SQLite control-plane DB (`ntc.db`); the orchestrator spawns a
-> controller process per service, and **auto-restarts** any that crashes (with
-> exponential backoff) while the gateway keeps serving. Builds on IPC (P4),
-> router (P3), parser (P2), event loop (P1).
+> Status: **P6** — authenticated control plane + CLI. The core listens on a
+> token-authenticated Unix control socket; the `ntc` CLI registers services and
+> routes **on a live server** (`ntc service add`, `ntc route add`) and the core
+> hot-reloads its routing table — plug-and-play, no restart. Also `status`,
+> `service/route list`, `service rm`, `stop`. Built on the orchestrator (P5),
+> IPC (P4), router (P3), parser (P2), event loop (P1).
+
+## CLI
+
+```sh
+ntc start 3000                              # run the gateway/core (the daemon)
+ntc status                                  # core status
+ntc service add hello ./build/hello_controller   # register + spawn (live)
+ntc route add GET /api/hello hello          # route to a service (live)
+ntc service list ; ntc route list
+ntc service rm hello ; ntc stop ; ntc token
+```
 
 ## Build & run
 

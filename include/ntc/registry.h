@@ -7,6 +7,7 @@
 #define NTC_REGISTRY_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include "ntc/err.h"
 
 typedef struct ntc_registry ntc_registry;
@@ -27,5 +28,11 @@ NTC_NODISCARD ntc_err ntc_registry_list_services(ntc_registry *r,
         ntc_service_row *out, size_t max, size_t *count);
 NTC_NODISCARD ntc_err ntc_registry_list_routes(ntc_registry *r,
         ntc_route_row *out, size_t max, size_t *count);
+
+/* key/value config (e.g. the control-plane token). */
+NTC_NODISCARD ntc_err ntc_registry_get_config(ntc_registry *r, const char *key,
+        char *out, size_t cap, bool *found);
+NTC_NODISCARD ntc_err ntc_registry_set_config(ntc_registry *r, const char *key,
+        const char *value);
 
 #endif /* NTC_REGISTRY_H */

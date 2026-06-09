@@ -3,6 +3,7 @@
 
 #include "ntc/arena.h"
 #include "ntc/builtin.h"
+#include "ntc/control.h"
 #include "ntc/http.h"
 #include "ntc/log.h"
 #include "ntc/poller.h"
@@ -18,8 +19,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,10 +40,11 @@
 #define NTC_BACKOFF_BASE   200    /* ms */
 #define NTC_BACKOFF_MAX    5000   /* ms */
 #define NTC_STABLE_MS      5000   /* uptime after which backoff resets */
+#define NTC_MAX_SERVICES   256
 
 #define JSON NTC_SLICE_LIT("application/json")
 
-enum { KIND_HTTP = 1, KIND_CTRL = 2 };
+enum { KIND_HTTP = 1, KIND_CTRL = 2, KIND_CONTROL = 3 };
 enum { CS_READ, CS_WAIT, CS_WRITE };
 
 static volatile sig_atomic_t g_stop = 0;
@@ -84,6 +88,7 @@ typedef struct service {
     char *name;
     char *bin;
     ctrl *conn;          /* current process connection; NULL when down */
+    bool disabled;       /* removed via control plane; do not restart */
     int restart_count;
     long restart_at;     /* monotonic ms; when to (re)spawn */
     long spawned_at;     /* monotonic ms; current process start */
@@ -91,12 +96,23 @@ typedef struct service {
     struct gateway *gw;
 } service;
 
+/* a short-lived control-plane client connection */
+typedef struct cctrl {
+    int kind;            /* KIND_CONTROL (must be first) */
+    int fd;
+    struct gateway *gw;
+    size_t len;
+    char buf[4096];
+} cctrl;
+
 typedef struct gateway {
     ntc_poller *p;
     ntc_router *router;
     ntc_registry *reg;
     int listen_fd;
-    service *services;
+    int control_fd;
+    char token[65];
+    service *services;   /* fixed array, cap NTC_MAX_SERVICES (stable pointers) */
     size_t nservices;
     conn *pending[NTC_MAX_INFLIGHT];
     uint32_t gen[NTC_MAX_INFLIGHT];
@@ -321,7 +337,7 @@ static int forward_marker(const ntc_request *r, const ntc_route_params *p,
 }
 
 static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc) {
-    if (!svc->conn)
+    if (svc->disabled || !svc->conn)
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"service unavailable\"}"));
 
     uint8_t *enc = ntc_arena_alloc(&c->arena, NTC_CONN_RBUF + 1024);
@@ -437,10 +453,19 @@ static int spawn_service(gateway *g, service *svc) {
     pid_t pid = fork();
     if (pid < 0) { close(sv[0]); close(sv[1]); return -1; }
     if (pid == 0) {
-        close(sv[0]);
+        /* child: keep only the controller socket; close every other inherited
+         * fd so we don't hold the core's listener / control conns / sibling
+         * controller sockets open (which would block their EOF). */
         char fdbuf[16];
         snprintf(fdbuf, sizeof fdbuf, "%d", sv[1]);
         setenv("NTC_CONTROLLER_FD", fdbuf, 1);
+        int maxfd = 1024;
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+            rl.rlim_cur < (rlim_t)maxfd)
+            maxfd = (int)rl.rlim_cur;
+        for (int i = 3; i < maxfd; i++)
+            if (i != sv[1]) close(i);
         execlp(svc->bin, svc->bin, (char *)NULL);
         _exit(127);
     }
@@ -493,6 +518,7 @@ static void supervise(gateway *g) {
     long t = now_ms();
     for (size_t i = 0; i < g->nservices; i++) {
         service *svc = &g->services[i];
+        if (svc->disabled) continue;
         if (!svc->conn) {
             if (t >= svc->restart_at) {
                 if (spawn_service(g, svc) == 0) {
@@ -517,7 +543,7 @@ static int poll_timeout(gateway *g) {
     int to = 1000;
     long t = now_ms();
     for (size_t i = 0; i < g->nservices; i++) {
-        if (!g->services[i].conn) {
+        if (!g->services[i].disabled && !g->services[i].conn) {
             long d = g->services[i].restart_at - t;
             if (d < 0) d = 0;
             if (d < to) to = (int)d;
@@ -549,9 +575,8 @@ static ntc_err load_registry(gateway *g) {
         }
     }
     if (scount == 0) return NTC_OK; /* built-ins only */
+    if (scount > NTC_MAX_SERVICES) scount = NTC_MAX_SERVICES;
 
-    g->services = calloc(scount, sizeof(service));
-    if (!g->services) return NTC_ERR_OOM;
     g->nservices = scount;
     for (size_t i = 0; i < scount; i++) {
         g->services[i].name = strdup(srows[i].name);
@@ -573,6 +598,198 @@ static ntc_err load_registry(gateway *g) {
     return NTC_OK;
 }
 
+/* ---- control plane ---- */
+static void gen_token(char *out, size_t cap) {
+    unsigned char b[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0 || read(fd, b, sizeof b) != (ssize_t)sizeof b) {
+        snprintf(out, cap, "ntc-insecure-token");
+        if (fd >= 0) close(fd);
+        return;
+    }
+    close(fd);
+    for (size_t i = 0; i < sizeof b && (2 * i + 2) < cap; i++)
+        snprintf(out + 2 * i, cap - 2 * i, "%02x", b[i]);
+}
+
+static void load_token(gateway *g) {
+    char buf[65]; bool found = false;
+    if (ntc_registry_get_config(g->reg, "control_token", buf, sizeof buf, &found) == NTC_OK && found) {
+        snprintf(g->token, sizeof g->token, "%s", buf);
+    } else {
+        gen_token(g->token, sizeof g->token);
+        (void)ntc_registry_set_config(g->reg, "control_token", g->token);
+    }
+    const char *tf = getenv("NTC_TOKEN_FILE");
+    if (!tf) tf = NTC_CONTROL_TOKEN_DEFAULT;
+    int fd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        ssize_t w = write(fd, g->token, strlen(g->token));
+        (void)w;
+        w = write(fd, "\n", 1);
+        (void)w;
+        close(fd);
+    }
+}
+
+static int make_control_socket(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    snprintf(un.sun_path, sizeof un.sun_path, "%s", path);
+    unlink(path);
+    if (bind(fd, (struct sockaddr *)&un, sizeof un) < 0) { close(fd); return -1; }
+    if (listen(fd, 16) < 0) { close(fd); return -1; }
+    if (set_nonblocking(fd) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+static service *service_add_live(gateway *g, const char *name, const char *bin) {
+    service *existing = find_service(g, name);
+    if (existing) {
+        free(existing->bin);
+        existing->bin = strdup(bin);
+        existing->disabled = false;
+        return existing;
+    }
+    if (g->nservices >= NTC_MAX_SERVICES) return NULL;
+    service *svc = &g->services[g->nservices];
+    memset(svc, 0, sizeof *svc);
+    svc->name = strdup(name);
+    svc->bin = strdup(bin);
+    svc->gw = g;
+    svc->backoff_ms = NTC_BACKOFF_BASE;
+    if (!svc->name || !svc->bin) { free(svc->name); free(svc->bin); return NULL; }
+    g->nservices++;
+    (void)spawn_service(g, svc);
+    return svc;
+}
+
+/* Append a one-line response and close the control connection. */
+static void cctrl_reply(gateway *g, cctrl *cc, const char *msg) {
+    size_t len = strlen(msg);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = write(cc->fd, msg + sent, len - sent);
+        if (w > 0) { sent += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        break;
+    }
+    (void)ntc_poller_del(g->p, cc->fd);
+    close(cc->fd);
+    free(cc);
+}
+
+static void process_control(gateway *g, cctrl *cc) {
+    char *nl = memchr(cc->buf, '\n', cc->len);
+    if (nl) *nl = '\0'; else cc->buf[cc->len < sizeof cc->buf ? cc->len : sizeof cc->buf - 1] = '\0';
+
+    char *save = NULL;
+    char *tok = strtok_r(cc->buf, " ", &save);
+    char *cmd = tok ? strtok_r(NULL, " ", &save) : NULL;
+    if (!tok || strcmp(tok, g->token) != 0) { cctrl_reply(g, cc, "ERR unauthorized\n"); return; }
+    if (!cmd) { cctrl_reply(g, cc, "ERR empty command\n"); return; }
+
+    char out[8192];
+    if (strcmp(cmd, "ping") == 0) {
+        cctrl_reply(g, cc, "OK pong\n");
+    } else if (strcmp(cmd, "status") == 0) {
+        snprintf(out, sizeof out,
+            "OK {\"services\":%zu,\"routes\":%zu,\"backend\":\"%s\",\"inflight_cap\":%u}\n",
+            g->nservices, ntc_router_count(g->router), ntc_poller_backend(), NTC_MAX_INFLIGHT);
+        cctrl_reply(g, cc, out);
+    } else if (strcmp(cmd, "service-add") == 0) {
+        char *name = strtok_r(NULL, " ", &save);
+        char *bin = strtok_r(NULL, " ", &save);
+        if (!name || !bin) { cctrl_reply(g, cc, "ERR usage: service-add <name> <bin>\n"); return; }
+        if (ntc_registry_add_service(g->reg, name, bin) != NTC_OK) { cctrl_reply(g, cc, "ERR registry write failed\n"); return; }
+        if (!service_add_live(g, name, bin)) { cctrl_reply(g, cc, "ERR too many services\n"); return; }
+        cctrl_reply(g, cc, "OK service added\n");
+    } else if (strcmp(cmd, "route-add") == 0) {
+        char *method = strtok_r(NULL, " ", &save);
+        char *pattern = strtok_r(NULL, " ", &save);
+        char *svcname = strtok_r(NULL, " ", &save);
+        if (!method || !pattern || !svcname) { cctrl_reply(g, cc, "ERR usage: route-add <METHOD> <pattern> <service>\n"); return; }
+        if (ntc_registry_add_route(g->reg, method, pattern, svcname) != NTC_OK) { cctrl_reply(g, cc, "ERR unknown service\n"); return; }
+        service *svc = find_service(g, svcname);
+        if (!svc) { cctrl_reply(g, cc, "ERR service not loaded\n"); return; }
+        if (ntc_router_add(g->router, method, pattern, forward_marker, svc) != NTC_OK) { cctrl_reply(g, cc, "ERR route register failed\n"); return; }
+        cctrl_reply(g, cc, "OK route added\n");
+    } else if (strcmp(cmd, "service-rm") == 0) {
+        char *name = strtok_r(NULL, " ", &save);
+        if (!name) { cctrl_reply(g, cc, "ERR usage: service-rm <name>\n"); return; }
+        ntc_err e = ntc_registry_remove_service(g->reg, name);
+        service *svc = find_service(g, name);
+        if (svc) {
+            svc->disabled = true;
+            if (svc->conn) { ctrl *ct = svc->conn; svc->conn = NULL;
+                (void)ntc_poller_del(g->p, ct->fd); kill(ct->pid, SIGTERM); close(ct->fd);
+                waitpid(ct->pid, NULL, WNOHANG); free(ct->rbuf); free(ct->wbuf); free(ct); }
+        }
+        cctrl_reply(g, cc, e == NTC_OK ? "OK service removed\n" : "ERR not found\n");
+    } else if (strcmp(cmd, "service-list") == 0) {
+        ntc_service_row rows[64]; size_t n = 0;
+        (void)ntc_registry_list_services(g->reg, rows, 64, &n);
+        size_t off = (size_t)snprintf(out, sizeof out, "OK [");
+        for (size_t i = 0; i < n && off < sizeof out - 128; i++)
+            off += (size_t)snprintf(out + off, sizeof out - off, "%s{\"name\":\"%s\",\"bin\":\"%s\"}",
+                                    i ? "," : "", rows[i].name, rows[i].bin);
+        snprintf(out + off, sizeof out - off, "]\n");
+        cctrl_reply(g, cc, out);
+    } else if (strcmp(cmd, "route-list") == 0) {
+        ntc_route_row rows[128]; size_t n = 0;
+        (void)ntc_registry_list_routes(g->reg, rows, 128, &n);
+        size_t off = (size_t)snprintf(out, sizeof out, "OK [");
+        for (size_t i = 0; i < n && off < sizeof out - 160; i++)
+            off += (size_t)snprintf(out + off, sizeof out - off,
+                                    "%s{\"method\":\"%s\",\"pattern\":\"%s\",\"service\":\"%s\"}",
+                                    i ? "," : "", rows[i].method, rows[i].pattern, rows[i].service);
+        snprintf(out + off, sizeof out - off, "]\n");
+        cctrl_reply(g, cc, out);
+    } else if (strcmp(cmd, "stop") == 0) {
+        g_stop = 1;
+        cctrl_reply(g, cc, "OK stopping\n");
+    } else {
+        cctrl_reply(g, cc, "ERR unknown command\n");
+    }
+}
+
+static void on_control_readable(gateway *g, cctrl *cc) {
+    for (;;) {
+        if (cc->len >= sizeof cc->buf - 1) { process_control(g, cc); return; }
+        ssize_t n = recv(cc->fd, cc->buf + cc->len, sizeof cc->buf - 1 - cc->len, 0);
+        if (n > 0) {
+            cc->len += (size_t)n;
+            if (memchr(cc->buf, '\n', cc->len)) { process_control(g, cc); return; }
+            continue;
+        }
+        if (n == 0) { (void)ntc_poller_del(g->p, cc->fd); close(cc->fd); free(cc); return; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        (void)ntc_poller_del(g->p, cc->fd); close(cc->fd); free(cc);
+        return;
+    }
+}
+
+static void accept_control(gateway *g) {
+    for (;;) {
+        int cfd = accept(g->control_fd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            return; /* EAGAIN or other: done */
+        }
+        if (set_nonblocking(cfd) < 0) { close(cfd); continue; }
+        cctrl *cc = calloc(1, sizeof *cc);
+        if (!cc) { close(cfd); continue; }
+        cc->kind = KIND_CONTROL;
+        cc->fd = cfd;
+        cc->gw = g;
+        if (ntc_poller_add(g->p, cfd, NTC_POLL_READ, cc) != NTC_OK) { close(cfd); free(cc); }
+    }
+}
+
 ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     (void)admin_port; /* read-only dashboard: P8 */
 
@@ -590,6 +807,10 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         ntc_router_destroy(g.router);
         return NTC_ERR_IO;
     }
+    g.control_fd = -1;
+    g.services = calloc(NTC_MAX_SERVICES, sizeof(service));
+    if (!g.services) { ntc_registry_close(g.reg); ntc_router_destroy(g.router); return NTC_ERR_OOM; }
+    load_token(&g);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
@@ -626,11 +847,22 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         ntc_poller_destroy(g.p); close(listen_fd); goto fail_pre_poll;
     }
 
+    const char *csock = ntc_control_sock_path();
+    g.control_fd = make_control_socket(csock);
+    if (g.control_fd >= 0) {
+        if (ntc_poller_add(g.p, g.control_fd, NTC_POLL_READ, NULL) != NTC_OK) {
+            close(g.control_fd); unlink(csock); g.control_fd = -1;
+        }
+    } else {
+        NTC_WARN("control socket '%s' unavailable; CLI control disabled", csock);
+    }
+
     if (load_registry(&g) != NTC_OK) NTC_WARN("registry load incomplete");
     for (size_t i = 0; i < g.nservices; i++) (void)spawn_service(&g, &g.services[i]);
 
-    NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, %zu services)",
-                (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router), g.nservices);
+    NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, %zu services, control %s)",
+                (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router), g.nservices,
+                g.control_fd >= 0 ? csock : "off");
 
     ntc_poll_event evs[NTC_MAX_EVENTS];
     while (!g_stop) {
@@ -642,7 +874,12 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         }
         for (int i = 0; i < n; i++) {
             if (evs[i].fd == listen_fd) { accept_all(&g); continue; }
+            if (evs[i].fd == g.control_fd) { accept_control(&g); continue; }
             int kind = *(int *)evs[i].udata;
+            if (kind == KIND_CONTROL) {
+                if (evs[i].events & NTC_POLL_READ) on_control_readable(&g, evs[i].udata);
+                continue;
+            }
             if (kind == KIND_CTRL) {
                 ctrl *ct = evs[i].udata;
                 if ((evs[i].events & NTC_POLL_READ) && on_ctrl_readable(&g, ct) < 0) continue;
@@ -675,11 +912,13 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     free(g.services);
     ntc_poller_destroy(g.p);
     close(listen_fd);
+    if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_OK;
 
 fail_pre_poll:
+    free(g.services);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_ERR_IO;

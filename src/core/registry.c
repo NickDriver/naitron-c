@@ -18,7 +18,10 @@ static const char *SCHEMA =
     "  method TEXT NOT NULL,"
     "  pattern TEXT NOT NULL,"
     "  service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,"
-    "  UNIQUE(method, pattern));";
+    "  UNIQUE(method, pattern));"
+    "CREATE TABLE IF NOT EXISTS config("
+    "  key TEXT PRIMARY KEY,"
+    "  value TEXT NOT NULL);";
 
 static ntc_err exec_sql(sqlite3 *db, const char *sql) {
     char *err = NULL;
@@ -147,9 +150,52 @@ ntc_err ntc_registry_list_routes(ntc_registry *r, ntc_route_row *out,
     return NTC_OK;
 }
 
+ntc_err ntc_registry_get_config(ntc_registry *r, const char *key, char *out,
+                                size_t cap, bool *found) {
+    if (!r || !key || !out || !found) return NTC_ERR_INVALID;
+    *found = false;
+    if (cap) out[0] = '\0';
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(r->db, "SELECT value FROM config WHERE key=?1", -1, &st, NULL) != SQLITE_OK)
+        return NTC_ERR_INTERNAL;
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        copy_text(out, cap, sqlite3_column_text(st, 0));
+        *found = true;
+    }
+    sqlite3_finalize(st);
+    return NTC_OK;
+}
+
+ntc_err ntc_registry_set_config(ntc_registry *r, const char *key, const char *value) {
+    if (!r || !key || !value) return NTC_ERR_INVALID;
+    const char *sql = "INSERT INTO config(key,value) VALUES(?1,?2) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(r->db, sql, -1, &st, NULL) != SQLITE_OK) return NTC_ERR_INTERNAL;
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, value, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? NTC_OK : NTC_ERR_INTERNAL;
+}
+
 #ifdef UNIT_TEST
 #include "ntc/test.h"
 #include "ntc/slice.h"
+
+TEST(registry, config_get_set) {
+    ntc_registry *r = NULL;
+    ASSERT_EQ_INT(NTC_OK, ntc_registry_open(&r, ":memory:"));
+    char buf[64]; bool found = true;
+    ASSERT_EQ_INT(NTC_OK, ntc_registry_get_config(r, "tok", buf, sizeof buf, &found));
+    ASSERT_FALSE(found);
+    ASSERT_EQ_INT(NTC_OK, ntc_registry_set_config(r, "tok", "secret123"));
+    ASSERT_EQ_INT(NTC_OK, ntc_registry_get_config(r, "tok", buf, sizeof buf, &found));
+    ASSERT_TRUE(found);
+    ASSERT_TRUE(ntc_slice_eq_cstr(ntc_slice_cstr(buf), "secret123"));
+    ntc_registry_close(r);
+}
 
 TEST(registry, add_and_list) {
     ntc_registry *r = NULL;
