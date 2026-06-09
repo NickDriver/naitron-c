@@ -1,18 +1,89 @@
-/* Integration tests for the gateway (black-box, span processes).
- *
- * These are planned (TODO) for P4, when the out-of-process controller path and
- * a spawn-a-server harness exist. They register as integration tests so the
- * runner can list/select them now, and we'll flip TODO -> real as we build. */
+/* Integration tests for the gateway: spawn the real ./build/ntc and talk HTTP. */
+#define _GNU_SOURCE
 #include "ntc/test.h"
+#include "it_util.h"
 
-ITEST_TODO(gateway, answers_200_over_tcp) {
-    /* P4: spawn `ntc start`, connect, send a request, assert HTTP/1.1 200. */
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Isolate each test: unique db/socket/token under /tmp, seeded controller. */
+static void iso_env(const char *tag) {
+    char p[256];
+    snprintf(p, sizeof p, "/tmp/ntc_it_%s.db", tag);     setenv("NTC_DB", p, 1); unlink(p);
+    snprintf(p, sizeof p, "/tmp/ntc_it_%s.sock", tag);    setenv("NTC_CONTROL_SOCK", p, 1); unlink(p);
+    snprintf(p, sizeof p, "/tmp/ntc_it_%s.token", tag);   setenv("NTC_TOKEN_FILE", p, 1); unlink(p);
+    setenv("NTC_CONTROLLER_BIN", "./build/hello_controller", 1);
 }
 
-ITEST_TODO(gateway, forwards_request_to_controller) {
-    /* P4: register a controller, hit its route, assert the controller ran. */
+static int body_pid(const char *resp) {
+    const char *b = strstr(resp, "\"pid\":");
+    int pid = -1;
+    if (b) sscanf(b, "\"pid\":%d", &pid);
+    return pid;
 }
 
-ITEST_TODO(gateway, restarts_crashed_controller) {
-    /* P5: kill a controller mid-flight, assert the supervisor restarts it. */
+ITEST(gateway, answers_200_over_tcp) {
+    iso_env("p200");
+    const char *argv[] = { "./build/ntc", "start", "38081", NULL };
+    pid_t srv = it_spawn(argv);
+    ASSERT_TRUE(srv > 0);
+    ASSERT_TRUE(it_wait_port(38081, 4000));
+
+    char resp[8192];
+    ASSERT_TRUE(it_get(38081, "/health", resp, sizeof resp) > 0);
+    ASSERT_EQ_INT(200, it_status(resp));
+    ASSERT_TRUE(strstr(resp, "\"status\":\"ok\"") != NULL);
+
+    ASSERT_TRUE(it_get(38081, "/nope", resp, sizeof resp) > 0);
+    ASSERT_EQ_INT(404, it_status(resp));
+
+    it_stop(srv);
+}
+
+ITEST(gateway, forwards_request_to_controller) {
+    iso_env("fwd");
+    const char *argv[] = { "./build/ntc", "start", "38082", NULL };
+    pid_t srv = it_spawn(argv);
+    ASSERT_TRUE(srv > 0);
+    ASSERT_TRUE(it_wait_port(38082, 4000));
+
+    char resp[8192];
+    ASSERT_TRUE(it_get(38082, "/api/hello", resp, sizeof resp) > 0);
+    ASSERT_EQ_INT(200, it_status(resp));
+    ASSERT_TRUE(strstr(resp, "\"controller\":\"hello\"") != NULL);
+    ASSERT_TRUE(body_pid(resp) > 0);
+
+    it_stop(srv);
+}
+
+ITEST(gateway, restarts_crashed_controller) {
+    iso_env("restart");
+    const char *argv[] = { "./build/ntc", "start", "38083", NULL };
+    pid_t srv = it_spawn(argv);
+    ASSERT_TRUE(srv > 0);
+    ASSERT_TRUE(it_wait_port(38083, 4000));
+
+    char resp[8192];
+    ASSERT_TRUE(it_get(38083, "/api/hello", resp, sizeof resp) > 0);
+    int pid1 = body_pid(resp);
+    ASSERT_TRUE(pid1 > 0);
+
+    kill(pid1, SIGKILL); /* crash the controller */
+
+    int pid2 = -1;
+    struct timespec slp = { 0, 100 * 1000 * 1000 };
+    for (int i = 0; i < 60; i++) { /* up to ~6s for supervisor to restart */
+        nanosleep(&slp, NULL);
+        if (it_get(38083, "/api/hello", resp, sizeof resp) <= 0) continue;
+        int p = body_pid(resp);
+        if (p > 0 && p != pid1) { pid2 = p; break; }
+    }
+    ASSERT_TRUE(pid2 > 0);          /* restarted... */
+    ASSERT_TRUE(pid2 != pid1);      /* ...as a new process */
+
+    it_stop(srv);
 }

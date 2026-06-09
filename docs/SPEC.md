@@ -185,9 +185,11 @@ dependencies (wire freeze must precede the SDKs).
 
 ---
 
-## Open decisions
+## Open decisions — RESOLVED (2026-06-09)
 
-1. **Crypto library:** BearSSL (recommended) vs OpenSSL.
-2. **Out-of-process middleware hook** in M2, or defer to later.
-3. **SDK home:** monorepo `sdk/<lang>/` vs separate repos.
-4. Default **dashboard port** (proposed `9090`) and **app.name** default.
+1. **Crypto library:** **BearSSL.**
+2. **Out-of-process middleware hook:** **deferred** (post-M6).
+3. **SDK home:** **monorepo** `sdk/<lang>/`.
+4. **Defaults:** dashboard port **9090**, app.name default **"naitron-c app"** — confirmed.
+
+See `docs/DECISIONS.md` for blockers found during implementation.

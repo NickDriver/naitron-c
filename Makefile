@@ -61,13 +61,14 @@ $(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
 $(TESTBIN): $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) | $(BUILD)
 	$(CC) $(COMMON) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(LDLIBS) -o $@
 
-test: $(TESTBIN)
+# integration tests spawn the release binaries, so build them first
+test: $(TESTBIN) $(BIN) $(HELLO_BIN)
 	$(TEST_RUN) ./$(TESTBIN)
 
 test-unit: $(TESTBIN)
 	$(TEST_RUN) ./$(TESTBIN) unit
 
-test-it: $(TESTBIN)
+test-it: $(TESTBIN) $(BIN) $(HELLO_BIN)
 	$(TEST_RUN) ./$(TESTBIN) it
 
 test-list: $(TESTBIN)
