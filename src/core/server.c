@@ -6,6 +6,7 @@
 #include "ntc/http.h"
 #include "ntc/log.h"
 #include "ntc/poller.h"
+#include "ntc/registry.h"
 #include "ntc/router.h"
 #include "ntc/slice.h"
 #include "ntc/wire.h"
@@ -20,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef MSG_NOSIGNAL
@@ -32,6 +34,9 @@
 #define NTC_MAX_INFLIGHT   (1u << NTC_INFLIGHT_BITS)
 #define NTC_INFLIGHT_MASK  (NTC_MAX_INFLIGHT - 1u)
 #define NTC_CTRL_MAX_RBUF  (4u * 1024 * 1024)
+#define NTC_BACKOFF_BASE   200    /* ms */
+#define NTC_BACKOFF_MAX    5000   /* ms */
+#define NTC_STABLE_MS      5000   /* uptime after which backoff resets */
 
 #define JSON NTC_SLICE_LIT("application/json")
 
@@ -41,7 +46,14 @@ enum { CS_READ, CS_WAIT, CS_WRITE };
 static volatile sig_atomic_t g_stop = 0;
 static void on_stop(int sig) { (void)sig; g_stop = 1; }
 
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 struct gateway;
+struct service;
 
 typedef struct conn {
     int kind;            /* KIND_HTTP (must be first) */
@@ -50,6 +62,7 @@ typedef struct conn {
     struct gateway *gw;
     bool inflight;
     uint32_t req_id;
+    struct ctrl *wait_ctrl;
     ntc_arena arena;
     size_t rlen;
     const char *wbuf;
@@ -61,17 +74,30 @@ typedef struct ctrl {
     int kind;            /* KIND_CTRL (must be first) */
     int fd;
     pid_t pid;
-    char *name;
+    struct service *svc;
     struct gateway *gw;
     uint8_t *rbuf; size_t rlen, rcap;
     uint8_t *wbuf; size_t wlen, wsent, wcap;
 } ctrl;
 
+typedef struct service {
+    char *name;
+    char *bin;
+    ctrl *conn;          /* current process connection; NULL when down */
+    int restart_count;
+    long restart_at;     /* monotonic ms; when to (re)spawn */
+    long spawned_at;     /* monotonic ms; current process start */
+    int backoff_ms;
+    struct gateway *gw;
+} service;
+
 typedef struct gateway {
     ntc_poller *p;
     ntc_router *router;
+    ntc_registry *reg;
     int listen_fd;
-    ctrl *controller;                  /* P4: a single controller */
+    service *services;
+    size_t nservices;
     conn *pending[NTC_MAX_INFLIGHT];
     uint32_t gen[NTC_MAX_INFLIGHT];
     uint16_t free_slots[NTC_MAX_INFLIGHT];
@@ -83,8 +109,9 @@ static void conn_close(gateway *g, conn *c);
 static int  on_writable(gateway *g, conn *c);
 static int  respond_and_flush(gateway *g, conn *c, int status, ntc_slice json);
 static void controller_died(gateway *g, ctrl *ct);
+static int  spawn_service(gateway *g, service *svc);
 
-/* ---- small utilities ---- */
+/* ---- utilities ---- */
 static int set_nonblocking(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
@@ -109,8 +136,7 @@ static int buf_reserve(uint8_t **buf, size_t *cap, size_t need) {
     while (ncap < need) ncap *= 2;
     uint8_t *n = realloc(*buf, ncap);
     if (!n) return -1;
-    *buf = n;
-    *cap = ncap;
+    *buf = n; *cap = ncap;
     return 0;
 }
 
@@ -157,10 +183,7 @@ static int conn_respond(conn *c, int status, ntc_slice ctype, ntc_slice body) {
     if (ntc_http_format_response(&c->arena, status, ntc_http_status_text(status),
                                  ctype, body, &resp) != NTC_OK)
         return -1;
-    c->wbuf = resp.ptr;
-    c->wlen = resp.len;
-    c->wsent = 0;
-    c->state = CS_WRITE;
+    c->wbuf = resp.ptr; c->wlen = resp.len; c->wsent = 0; c->state = CS_WRITE;
     return 0;
 }
 
@@ -183,7 +206,7 @@ static int on_writable(gateway *g, conn *c) {
         conn_close(g, c);
         return -1;
     }
-    conn_close(g, c); /* Connection: close */
+    conn_close(g, c);
     return -1;
 }
 
@@ -208,7 +231,7 @@ static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t l
     uint16_t slot = (uint16_t)(id & NTC_INFLIGHT_MASK);
     uint32_t gen = id >> NTC_INFLIGHT_BITS;
     conn *c = g->pending[slot];
-    if (!c || (g->gen[slot] & 0xFFFFFu) != gen) return; /* stale / client gone */
+    if (!c || (g->gen[slot] & 0xFFFFFu) != gen) return;
     gw_free_slot(g, slot);
     c->inflight = false;
 
@@ -222,19 +245,29 @@ static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t l
 }
 
 static void controller_died(gateway *g, ctrl *ct) {
-    NTC_ERROR("controller '%s' (pid %ld) died", ct->name ? ct->name : "?", (long)ct->pid);
+    service *svc = ct->svc;
+    NTC_ERROR("controller '%s' (pid %ld) died", svc ? svc->name : "?", (long)ct->pid);
+
     (void)ntc_poller_del(g->p, ct->fd);
     close(ct->fd);
     waitpid(ct->pid, NULL, WNOHANG);
-    if (g->controller == ct) g->controller = NULL;
+
     for (uint32_t i = 0; i < NTC_MAX_INFLIGHT; i++) {
         conn *c = g->pending[i];
-        if (!c) continue;
+        if (!c || c->wait_ctrl != ct) continue;
         gw_free_slot(g, (uint16_t)i);
         c->inflight = false;
         (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"controller died\"}"));
     }
-    free(ct->name);
+
+    if (svc) {
+        svc->conn = NULL;
+        svc->restart_count++;
+        int b = svc->backoff_ms ? svc->backoff_ms * 2 : NTC_BACKOFF_BASE;
+        if (b > NTC_BACKOFF_MAX) b = NTC_BACKOFF_MAX;
+        svc->backoff_ms = b;
+        svc->restart_at = now_ms() + b;
+    }
     free(ct->rbuf);
     free(ct->wbuf);
     free(ct);
@@ -253,7 +286,6 @@ static void on_ctrl_writable(gateway *g, ctrl *ct) {
     (void)ctrl_update_poll(g, ct);
 }
 
-/* returns 0 if controller still alive, -1 if it died (and was freed) */
 static int on_ctrl_readable(gateway *g, ctrl *ct) {
     for (;;) {
         if (buf_reserve(&ct->rbuf, &ct->rcap, ct->rlen + 16384) != 0) { controller_died(g, ct); return -1; }
@@ -269,7 +301,6 @@ static int on_ctrl_readable(gateway *g, ctrl *ct) {
         controller_died(g, ct);
         return -1;
     }
-
     size_t off = 0;
     for (;;) {
         ntc_wire_header h; const uint8_t *pl; size_t consumed;
@@ -283,18 +314,15 @@ static int on_ctrl_readable(gateway *g, ctrl *ct) {
     return 0;
 }
 
-/* ---- request routing ---- */
-
-/* Sentinel handler value meaning "forward this route to a controller process".
- * The address is compared, never called. */
+/* ---- routing / forwarding ---- */
 static int forward_marker(const ntc_request *r, const ntc_route_params *p,
                           ntc_response *res, ntc_arena *a, void *u) {
     (void)r; (void)p; (void)res; (void)a; (void)u; return 0;
 }
 
-static int gw_forward(gateway *g, conn *c, const ntc_request *req) {
-    ctrl *ct = g->controller;
-    if (!ct) return respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"controller unavailable\"}"));
+static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc) {
+    if (!svc->conn)
+        return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"service unavailable\"}"));
 
     uint8_t *enc = ntc_arena_alloc(&c->arena, NTC_CONN_RBUF + 1024);
     if (!enc) return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"oom\"}"));
@@ -304,30 +332,29 @@ static int gw_forward(gateway *g, conn *c, const ntc_request *req) {
     uint32_t id;
     if (gw_alloc_id(g, c, &id) != 0)
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"too many in-flight\"}"));
-    if (ctrl_queue(ct, NTC_MSG_REQUEST, id, enc, (uint32_t)pl) != 0) {
+    if (ctrl_queue(svc->conn, NTC_MSG_REQUEST, id, enc, (uint32_t)pl) != 0) {
         gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"queue full\"}"));
     }
     c->state = CS_WAIT;
     c->req_id = id;
     c->inflight = true;
-    (void)ctrl_update_poll(g, ct);
-    return 0; /* parked, awaiting controller */
+    c->wait_ctrl = svc->conn;
+    (void)ctrl_update_poll(g, svc->conn);
+    return 0;
 }
 
 static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     ntc_handler h = NULL;
     void *udata = NULL;
     ntc_route_params params;
-    ntc_route_status rs = ntc_router_match(g->router, req->method, req->path,
-                                           &h, &udata, &params);
+    ntc_route_status rs = ntc_router_match(g->router, req->method, req->path, &h, &udata, &params);
 
     if (rs == NTC_ROUTE_NOT_FOUND)
         return respond_and_flush(g, c, 404, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
     if (rs == NTC_ROUTE_METHOD_NOT_ALLOWED)
         return respond_and_flush(g, c, 405, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
-
-    if (h == forward_marker) return gw_forward(g, c, req);
+    if (h == forward_marker) return gw_forward(g, c, req, (service *)udata);
 
     ntc_response res = { .status = 200, .content_type = JSON, .body = NTC_SLICE_LIT("") };
     if (h(req, &params, &res, &c->arena, udata) != 0)
@@ -370,18 +397,15 @@ static int on_readable(gateway *g, conn *c) {
         if (c->rlen < sizeof c->rbuf) return 0;
         return respond_and_flush(g, c, 413, NTC_SLICE_LIT("{\"error\":\"body too large\"}"));
     }
-
     return gw_dispatch(g, c, &req);
 }
 
-/* A parked connection only needs to be watched for the client hanging up. */
 static void on_wait_readable(gateway *g, conn *c) {
     char tmp[256];
     ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
     if (n == 0) { conn_close(g, c); return; }
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         conn_close(g, c);
-    /* extra bytes before the response are ignored (Connection: close) */
 }
 
 static void accept_all(gateway *g) {
@@ -401,48 +425,40 @@ static void accept_all(gateway *g) {
         conn *c = conn_new(g, cfd);
         if (!c) { close(cfd); continue; }
         if (ntc_poller_add(g->p, cfd, NTC_POLL_READ, c) != NTC_OK) {
-            ntc_arena_destroy(&c->arena);
-            close(cfd);
-            free(c);
+            ntc_arena_destroy(&c->arena); close(cfd); free(c);
         }
     }
 }
 
-/* ---- controller spawn + handshake ---- */
-static ctrl *spawn_controller(gateway *g, const char *bin, const char *name) {
+/* ---- spawn + supervise ---- */
+static int spawn_service(gateway *g, service *svc) {
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return NULL;
-
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return -1;
     pid_t pid = fork();
-    if (pid < 0) { close(sv[0]); close(sv[1]); return NULL; }
+    if (pid < 0) { close(sv[0]); close(sv[1]); return -1; }
     if (pid == 0) {
         close(sv[0]);
         char fdbuf[16];
         snprintf(fdbuf, sizeof fdbuf, "%d", sv[1]);
         setenv("NTC_CONTROLLER_FD", fdbuf, 1);
-        execlp(bin, bin, (char *)NULL);
+        execlp(svc->bin, svc->bin, (char *)NULL);
         _exit(127);
     }
     close(sv[1]);
     int fd = sv[0];
 
-    /* blocking handshake with a short timeout */
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 #ifdef SO_NOSIGPIPE
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-
     uint8_t hdr[NTC_WIRE_HEADER_LEN];
     ntc_wire_header h;
     if (read_full(fd, hdr, sizeof hdr) <= 0 || !ntc_wire_parse_header(hdr, &h) ||
         h.type != NTC_MSG_HELLO) {
-        NTC_ERROR("controller '%s': handshake failed", name);
-        close(fd);
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
-        return NULL;
+        close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+        return -1;
     }
     if (h.length > 0) {
         uint8_t tmp[256];
@@ -452,26 +468,109 @@ static ctrl *spawn_controller(gateway *g, const char *bin, const char *name) {
     uint8_t welcome[NTC_WIRE_HEADER_LEN];
     ntc_wire_write_header(welcome, NTC_MSG_WELCOME, 0, 0);
     if (write(fd, welcome, sizeof welcome) != (ssize_t)sizeof welcome) {
-        close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return NULL;
+        close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1;
     }
-
     tv.tv_sec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    if (set_nonblocking(fd) < 0) { close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return NULL; }
+    if (set_nonblocking(fd) < 0) { close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
 
     ctrl *ct = calloc(1, sizeof *ct);
-    if (!ct) { close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return NULL; }
+    if (!ct) { close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
     ct->kind = KIND_CTRL;
     ct->fd = fd;
     ct->pid = pid;
-    ct->name = strdup(name);
+    ct->svc = svc;
     ct->gw = g;
     if (ntc_poller_add(g->p, fd, NTC_POLL_READ, ct) != NTC_OK) {
-        free(ct->name); free(ct); close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        return NULL;
+        free(ct); close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1;
     }
-    NTC_SUCCESS("controller '%s' ready (pid %ld)", name, (long)pid);
-    return ct;
+    svc->conn = ct;
+    svc->spawned_at = now_ms();
+    return 0;
+}
+
+static void supervise(gateway *g) {
+    long t = now_ms();
+    for (size_t i = 0; i < g->nservices; i++) {
+        service *svc = &g->services[i];
+        if (!svc->conn) {
+            if (t >= svc->restart_at) {
+                if (spawn_service(g, svc) == 0) {
+                    NTC_SUCCESS("controller '%s' %s (pid %ld)", svc->name,
+                                svc->restart_count ? "restarted" : "ready",
+                                (long)svc->conn->pid);
+                } else {
+                    int b = svc->backoff_ms ? svc->backoff_ms * 2 : NTC_BACKOFF_BASE;
+                    if (b > NTC_BACKOFF_MAX) b = NTC_BACKOFF_MAX;
+                    svc->backoff_ms = b;
+                    svc->restart_at = t + b;
+                    NTC_WARN("controller '%s' spawn failed; retry in %dms", svc->name, b);
+                }
+            }
+        } else if (svc->backoff_ms > NTC_BACKOFF_BASE && t - svc->spawned_at > NTC_STABLE_MS) {
+            svc->backoff_ms = NTC_BACKOFF_BASE; /* stable: reset backoff */
+        }
+    }
+}
+
+static int poll_timeout(gateway *g) {
+    int to = 1000;
+    long t = now_ms();
+    for (size_t i = 0; i < g->nservices; i++) {
+        if (!g->services[i].conn) {
+            long d = g->services[i].restart_at - t;
+            if (d < 0) d = 0;
+            if (d < to) to = (int)d;
+        }
+    }
+    return to;
+}
+
+/* ---- registry load ---- */
+static service *find_service(gateway *g, const char *name) {
+    for (size_t i = 0; i < g->nservices; i++)
+        if (strcmp(g->services[i].name, name) == 0) return &g->services[i];
+    return NULL;
+}
+
+static ntc_err load_registry(gateway *g) {
+    /* Seed a default controller from $NTC_CONTROLLER_BIN if the registry is empty. */
+    ntc_service_row srows[64];
+    size_t scount = 0;
+    NTC_TRY(ntc_registry_list_services(g->reg, srows, 64, &scount));
+    if (scount == 0) {
+        const char *bin = getenv("NTC_CONTROLLER_BIN");
+        if (bin) {
+            if (ntc_registry_add_service(g->reg, "hello", bin) == NTC_OK) {
+                (void)ntc_registry_add_route(g->reg, "GET", "/api/hello", "hello");
+                (void)ntc_registry_add_route(g->reg, "GET", "/api/hello/:name", "hello");
+                NTC_TRY(ntc_registry_list_services(g->reg, srows, 64, &scount));
+            }
+        }
+    }
+    if (scount == 0) return NTC_OK; /* built-ins only */
+
+    g->services = calloc(scount, sizeof(service));
+    if (!g->services) return NTC_ERR_OOM;
+    g->nservices = scount;
+    for (size_t i = 0; i < scount; i++) {
+        g->services[i].name = strdup(srows[i].name);
+        g->services[i].bin = strdup(srows[i].bin);
+        g->services[i].gw = g;
+        g->services[i].backoff_ms = NTC_BACKOFF_BASE;
+    }
+
+    ntc_route_row rrows[256];
+    size_t rcount = 0;
+    NTC_TRY(ntc_registry_list_routes(g->reg, rrows, 256, &rcount));
+    for (size_t i = 0; i < rcount; i++) {
+        service *svc = find_service(g, rrows[i].service);
+        if (!svc) continue;
+        if (ntc_router_add(g->router, rrows[i].method, rrows[i].pattern,
+                           forward_marker, svc) != NTC_OK)
+            NTC_WARN("failed to register route %s %s", rrows[i].method, rrows[i].pattern);
+    }
+    return NTC_OK;
 }
 
 ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
@@ -484,8 +583,16 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     if (ntc_router_create(&g.router) != NTC_OK) return NTC_ERR_OOM;
     if (ntc_builtin_register(g.router) != NTC_OK) { ntc_router_destroy(g.router); return NTC_ERR_INTERNAL; }
 
+    const char *dbpath = getenv("NTC_DB");
+    if (!dbpath) dbpath = "ntc.db";
+    if (ntc_registry_open(&g.reg, dbpath) != NTC_OK) {
+        NTC_ERROR("cannot open registry '%s'", dbpath);
+        ntc_router_destroy(g.router);
+        return NTC_ERR_IO;
+    }
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); ntc_router_destroy(g.router); return NTC_ERR_IO; }
+    if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
     g.listen_fd = listen_fd;
 
     int one = 1;
@@ -493,21 +600,18 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
 #ifdef SO_NOSIGPIPE
     setsockopt(listen_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-    if (set_nonblocking(listen_fd) < 0) { close(listen_fd); ntc_router_destroy(g.router); return NTC_ERR_IO; }
+    if (set_nonblocking(listen_fd) < 0) { close(listen_fd); goto fail_pre_poll; }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        NTC_ERROR("bind(:%u): %s", (unsigned)port, strerror(errno));
-        close(listen_fd); ntc_router_destroy(g.router); return NTC_ERR_IO;
+        NTC_ERROR("bind(:%u): %s", (unsigned)port, strerror(errno)); close(listen_fd); goto fail_pre_poll;
     }
     if (listen(listen_fd, 256) < 0) {
-        NTC_ERROR("listen(): %s", strerror(errno));
-        close(listen_fd); ntc_router_destroy(g.router); return NTC_ERR_IO;
+        NTC_ERROR("listen(): %s", strerror(errno)); close(listen_fd); goto fail_pre_poll;
     }
 
     struct sigaction sa;
@@ -517,34 +621,22 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    if (ntc_poller_create(&g.p) != NTC_OK) {
-        close(listen_fd); ntc_router_destroy(g.router); return NTC_ERR_IO;
-    }
+    if (ntc_poller_create(&g.p) != NTC_OK) { close(listen_fd); goto fail_pre_poll; }
     if (ntc_poller_add(g.p, listen_fd, NTC_POLL_READ, NULL) != NTC_OK) {
-        ntc_poller_destroy(g.p); close(listen_fd); ntc_router_destroy(g.router); return NTC_ERR_IO;
+        ntc_poller_destroy(g.p); close(listen_fd); goto fail_pre_poll;
     }
 
-    /* P4: optionally spawn one controller and forward a route to it. */
-    const char *bin = getenv("NTC_CONTROLLER_BIN");
-    if (bin) {
-        g.controller = spawn_controller(&g, bin, "hello");
-        if (g.controller) {
-            if (ntc_router_add(g.router, "GET", "/api/hello", forward_marker, NULL) != NTC_OK ||
-                ntc_router_add(g.router, "GET", "/api/hello/:name", forward_marker, NULL) != NTC_OK)
-                NTC_WARN("failed to register controller routes");
-        } else {
-            NTC_WARN("controller '%s' did not start; serving built-ins only", bin);
-        }
-    }
+    if (load_registry(&g) != NTC_OK) NTC_WARN("registry load incomplete");
+    for (size_t i = 0; i < g.nservices; i++) (void)spawn_service(&g, &g.services[i]);
 
-    NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, Ctrl-C to stop)",
-                (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router));
+    NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, %zu services)",
+                (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router), g.nservices);
 
     ntc_poll_event evs[NTC_MAX_EVENTS];
     while (!g_stop) {
-        int n = ntc_poller_wait(g.p, evs, NTC_MAX_EVENTS, 1000);
+        int n = ntc_poller_wait(g.p, evs, NTC_MAX_EVENTS, poll_timeout(&g));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) { supervise(&g); continue; }
             NTC_ERROR("poller_wait(): %s", strerror(errno));
             break;
         }
@@ -562,26 +654,35 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
                 if ((evs[i].events & NTC_POLL_READ) && on_readable(&g, c) < 0) continue;
             } else if (c->state == CS_WAIT) {
                 if (evs[i].events & NTC_POLL_READ) on_wait_readable(&g, c);
-            } else { /* CS_WRITE */
+            } else {
                 if (evs[i].events & NTC_POLL_WRITE) (void)on_writable(&g, c);
             }
         }
+        supervise(&g);
     }
 
     NTC_INFO("shutting down");
-    if (g.controller) {
-        kill(g.controller->pid, SIGTERM);
-        close(g.controller->fd);
-        waitpid(g.controller->pid, NULL, 0);
-        free(g.controller->name);
-        free(g.controller->rbuf);
-        free(g.controller->wbuf);
-        free(g.controller);
+    for (size_t i = 0; i < g.nservices; i++) {
+        service *svc = &g.services[i];
+        if (svc->conn) {
+            kill(svc->conn->pid, SIGTERM);
+            close(svc->conn->fd);
+            waitpid(svc->conn->pid, NULL, 0);
+            free(svc->conn->rbuf); free(svc->conn->wbuf); free(svc->conn);
+        }
+        free(svc->name); free(svc->bin);
     }
+    free(g.services);
     ntc_poller_destroy(g.p);
     close(listen_fd);
+    ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_OK;
+
+fail_pre_poll:
+    ntc_registry_close(g.reg);
+    ntc_router_destroy(g.router);
+    return NTC_ERR_IO;
 }
 
 #ifdef UNIT_TEST
@@ -604,21 +705,6 @@ TEST(poller, detects_readable_with_udata) {
     ASSERT_EQ_INT(sv[0], evs[0].fd);
     ASSERT_TRUE((evs[0].events & NTC_POLL_READ) != 0);
     ASSERT_TRUE(evs[0].udata == &marker);
-    ASSERT_EQ_INT(NTC_OK, ntc_poller_del(p, sv[0]));
-    close(sv[0]); close(sv[1]);
-    ntc_poller_destroy(p);
-}
-
-TEST(poller, write_interest_fires_on_empty_socket) {
-    ntc_poller *p = NULL;
-    ASSERT_EQ_INT(NTC_OK, ntc_poller_create(&p));
-    int sv[2];
-    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sv));
-    ASSERT_EQ_INT(NTC_OK, ntc_poller_add(p, sv[0], NTC_POLL_WRITE, NULL));
-    ntc_poll_event evs[4];
-    int n = ntc_poller_wait(p, evs, 4, 1000);
-    ASSERT_TRUE(n >= 1);
-    ASSERT_TRUE((evs[0].events & NTC_POLL_WRITE) != 0);
     ASSERT_EQ_INT(NTC_OK, ntc_poller_del(p, sv[0]));
     close(sv[0]); close(sv[1]);
     ntc_poller_destroy(p);

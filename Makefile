@@ -19,6 +19,9 @@ REL_FLAGS  := -O2 -DNDEBUG
 TEST_FLAGS := -O1 -g -DUNIT_TEST -fsanitize=address,undefined -fno-omit-frame-pointer
 COV_FLAGS  := -O0 -g -DUNIT_TEST -fprofile-instr-generate -fcoverage-mapping
 
+# core + registry link against SQLite (the control-plane DB)
+LDLIBS := -lsqlite3
+
 # libcommon + core gateway (everything in src/core except the CLI main)
 SRC_LIB   := $(wildcard src/common/*.c) \
              $(filter-out src/core/main.c, $(wildcard src/core/*.c))
@@ -46,7 +49,7 @@ all: $(BIN) $(HELLO_BIN)
 controllers: $(HELLO_BIN)
 
 $(BIN): $(SRC_LIB) $(SRC_MAIN) | $(BUILD)
-	$(CC) $(COMMON) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) -o $@
+	$(CC) $(COMMON) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) $(LDLIBS) -o $@
 	@echo "built $@"
 
 $(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
@@ -56,7 +59,7 @@ $(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
 # All objects are linked directly (no static archive) so the TEST()
 # constructors are never dropped by the linker.
 $(TESTBIN): $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) | $(BUILD)
-	$(CC) $(COMMON) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) -o $@
+	$(CC) $(COMMON) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(LDLIBS) -o $@
 
 test: $(TESTBIN)
 	$(TEST_RUN) ./$(TESTBIN)
@@ -71,7 +74,7 @@ test-list: $(TESTBIN)
 	./$(TESTBIN) list
 
 coverage: | $(BUILD)
-	$(CC) $(COMMON) $(COV_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) -o $(COVBIN)
+	$(CC) $(COMMON) $(COV_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(LDLIBS) -o $(COVBIN)
 	LLVM_PROFILE_FILE=$(BUILD)/ntc.profraw ./$(COVBIN) >/dev/null 2>&1 || true
 	xcrun llvm-profdata merge -sparse $(BUILD)/ntc.profraw -o $(BUILD)/ntc.profdata
 	xcrun llvm-cov report ./$(COVBIN) -instr-profile=$(BUILD)/ntc.profdata $(SRC_LIB)

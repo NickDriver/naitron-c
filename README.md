@@ -5,13 +5,11 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P4** — IPC + Controller SDK + out-of-process controllers. The core
-> spawns controller **processes** (socketpair + fork/exec), performs a versioned
-> handshake, and forwards routed requests over a length-framed wire protocol,
-> correlating responses asynchronously through the event loop. A killed
-> controller yields `502` — the gateway survives (true process isolation). The
-> Controller SDK hides the wire protocol from controller authors. Built on the
-> P1 event loop + P2 parser + P3 router.
+> Status: **P5** — orchestrator with supervision + SQLite registry. Services and
+> routes live in a SQLite control-plane DB (`ntc.db`); the orchestrator spawns a
+> controller process per service, and **auto-restarts** any that crashes (with
+> exponential backoff) while the gateway keeps serving. Builds on IPC (P4),
+> router (P3), parser (P2), event loop (P1).
 
 ## Build & run
 
