@@ -6,6 +6,7 @@
 #include "ntc/control.h"
 #include "ntc/err.h"
 #include "ntc/log.h"
+#include "ntc/mcp.h"
 #include "ntc/server.h"
 #include "ntc/signal.h"
 #include "ntc/version.h"
@@ -43,9 +44,10 @@ static void usage(const char *prog) {
         "  %s route add <METHOD> <path> <svc>    route a path to a service (live)\n"
         "  %s route list                         list routes\n"
         "  %s stop                               stop the running core\n"
+        "  %s mcp                                run the built-in MCP server (stdio)\n"
         "  %s token                              print the control token + socket\n"
         "  %s version | help\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_port(const char *s, uint16_t *out) {
@@ -108,6 +110,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(cmd, "start") == 0) return run_start(prog, argc, argv);
+    if (strcmp(cmd, "mcp") == 0) return ntc_mcp_run();
     if (strcmp(cmd, "status") == 0) return do_control("status");
     if (strcmp(cmd, "stop") == 0) return do_control("stop");
 

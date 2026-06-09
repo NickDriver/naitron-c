@@ -5,12 +5,11 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P6** — authenticated control plane + CLI. The core listens on a
-> token-authenticated Unix control socket; the `ntc` CLI registers services and
-> routes **on a live server** (`ntc service add`, `ntc route add`) and the core
-> hot-reloads its routing table — plug-and-play, no restart. Also `status`,
-> `service/route list`, `service rm`, `stop`. Built on the orchestrator (P5),
-> IPC (P4), router (P3), parser (P2), event loop (P1).
+> Status: **P7** — built-in MCP server. `ntc mcp` is a JSON-RPC stdio MCP server
+> exposing the control plane as tools (`naitron_add_service`, `naitron_add_route`,
+> `naitron_status`, …), so an AI client (e.g. Claude) can inspect and manage a
+> live server. Includes a small arena-based JSON parser. Built on the control
+> plane (P6), orchestrator (P5), IPC (P4), router (P3), parser (P2), loop (P1).
 
 ## CLI
 
