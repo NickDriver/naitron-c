@@ -34,12 +34,23 @@ BIN     := $(BUILD)/ntc
 TESTBIN := $(BUILD)/ntc_test
 COVBIN  := $(BUILD)/ntc_cov
 
-.PHONY: all test test-unit test-it test-list coverage run clean
+# Example out-of-process controller (its own binary; links the SDK + wire).
+HELLO_BIN := $(BUILD)/hello_controller
+SDK_SRC   := src/common/controller_sdk.c src/common/wire.c \
+             src/common/arena.c src/common/slice.c
 
-all: $(BIN)
+.PHONY: all controllers test test-unit test-it test-list coverage run clean
+
+all: $(BIN) $(HELLO_BIN)
+
+controllers: $(HELLO_BIN)
 
 $(BIN): $(SRC_LIB) $(SRC_MAIN) | $(BUILD)
 	$(CC) $(COMMON) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) -o $@
+	@echo "built $@"
+
+$(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
+	$(CC) $(COMMON) $(REL_FLAGS) controllers/hello_controller.c $(SDK_SRC) -o $@
 	@echo "built $@"
 
 # All objects are linked directly (no static archive) so the TEST()

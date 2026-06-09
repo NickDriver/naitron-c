@@ -35,6 +35,13 @@ typedef enum ntc_parse_result {
     NTC_PARSE_ERROR       /* malformed */
 } ntc_parse_result;
 
+/* What a controller fills in; body is allocated in the request arena. */
+typedef struct ntc_response {
+    int status;
+    ntc_slice content_type;
+    ntc_slice body;
+} ntc_response;
+
 /* Parse a request from buf[0..len). Slices point into buf (zero-copy), so buf
  * must outlive `req`. On OK, *consumed = bytes through the end of headers, and
  * req->body is whatever body bytes are already in buf (compare to

@@ -5,12 +5,13 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P3** — router + controller contract. The gateway routes each
-> request (method + `/path/:param` patterns) to an in-process controller that
-> fills an `ntc_response` using the request arena; 404/405 handled. Built-ins:
-> `GET /health`, `GET /version`, `GET /api/echo/:name`. The same request-in/
-> response-out contract will carry across the IPC boundary in P4. Built on the
-> P1 event loop + P2 parser.
+> Status: **P4** — IPC + Controller SDK + out-of-process controllers. The core
+> spawns controller **processes** (socketpair + fork/exec), performs a versioned
+> handshake, and forwards routed requests over a length-framed wire protocol,
+> correlating responses asynchronously through the event loop. A killed
+> controller yields `502` — the gateway survives (true process isolation). The
+> Controller SDK hides the wire protocol from controller authors. Built on the
+> P1 event loop + P2 parser + P3 router.
 
 ## Build & run
 

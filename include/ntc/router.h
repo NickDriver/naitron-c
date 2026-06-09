@@ -16,11 +16,7 @@
 
 #define NTC_MAX_PARAMS 8
 
-typedef struct ntc_response {
-    int status;
-    ntc_slice content_type;
-    ntc_slice body;
-} ntc_response;
+/* ntc_response lives in http.h (shared with controllers). */
 
 typedef struct ntc_route_params {
     struct { ntc_slice name, value; } items[NTC_MAX_PARAMS];
