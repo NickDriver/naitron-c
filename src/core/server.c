@@ -7,12 +7,14 @@
 #include "ntc/http.h"
 #include "ntc/log.h"
 #include "ntc/mcp.h"
+#include "ntc/middleware.h"
 #include "ntc/poller.h"
 #include "ntc/registry.h"
 #include "ntc/router.h"
 #include "ntc/slice.h"
 #include "ntc/wire.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -69,6 +71,14 @@ typedef struct conn {
     bool inflight;
     uint32_t req_id;
     struct ctrl *wait_ctrl;
+    /* middleware / access-log state */
+    char client_ip[46];
+    char request_id[40];
+    char extra_headers[512];
+    char log_method[16];
+    char log_path[200];
+    long req_start;
+    bool logged;
     ntc_arena arena;
     size_t rlen;
     const char *wbuf;
@@ -122,6 +132,7 @@ typedef struct gateway {
     int admin_fd;
     int control_fd;
     metrics m;
+    ntc_mw *mw;
     char token[65];
     char app_name[128];
     service *services;   /* fixed array, cap NTC_MAX_SERVICES (stable pointers) */
@@ -202,6 +213,7 @@ static conn *conn_new(gateway *g, int fd) {
     c->fd = fd;
     c->state = CS_READ;
     c->gw = g;
+    c->req_start = now_ms();
     if (ntc_arena_init(&c->arena, 4096) != NTC_OK) { free(c); return NULL; }
     return c;
 }
@@ -216,10 +228,16 @@ static void conn_close(gateway *g, conn *c) {
 
 static int conn_respond(conn *c, int status, ntc_slice ctype, ntc_slice body) {
     ntc_slice resp;
-    if (ntc_http_format_response(&c->arena, status, ntc_http_status_text(status),
-                                 ctype, body, &resp) != NTC_OK)
+    if (ntc_http_format_response_ex(&c->arena, status, ntc_http_status_text(status), ctype,
+                                    c->extra_headers[0] ? c->extra_headers : NULL,
+                                    body, &resp) != NTC_OK)
         return -1;
     c->wbuf = resp.ptr; c->wlen = resp.len; c->wsent = 0; c->state = CS_WRITE;
+    if (!c->is_admin && !c->logged && c->gw->mw) {
+        ntc_mw_after(c->gw->mw, c->log_method, c->log_path, c->request_id, status,
+                     now_ms() - c->req_start);
+        c->logged = true;
+    }
     return 0;
 }
 
@@ -612,6 +630,21 @@ static int on_readable(gateway *g, conn *c) {
         if (c->rlen < sizeof c->rbuf) return 0;
         return respond_and_flush(g, c, 413, NTC_SLICE_LIT("{\"error\":\"body too large\"}"));
     }
+
+    /* middleware before-chain (main conns): request-id, CORS, rate-limit */
+    if (!c->is_admin) {
+        size_t ml = req.method.len < sizeof c->log_method - 1 ? req.method.len : sizeof c->log_method - 1;
+        memcpy(c->log_method, req.method.ptr, ml); c->log_method[ml] = '\0';
+        size_t pl = req.path.len < sizeof c->log_path - 1 ? req.path.len : sizeof c->log_path - 1;
+        memcpy(c->log_path, req.path.ptr, pl); c->log_path[pl] = '\0';
+        if (g->mw) {
+            ntc_mw_result r;
+            bool sc = ntc_mw_before(g->mw, &req, c->client_ip, now_ms(), &r);
+            snprintf(c->extra_headers, sizeof c->extra_headers, "%s", r.extra_headers);
+            snprintf(c->request_id, sizeof c->request_id, "%s", r.request_id);
+            if (sc) { rec_status(g, r.status); return send_resp(g, c, r.status, r.content_type, r.body); }
+        }
+    }
     return c->is_admin ? handle_admin(g, c, &req) : gw_dispatch(g, c, &req);
 }
 
@@ -625,7 +658,9 @@ static void on_wait_readable(gateway *g, conn *c) {
 
 static void accept_conns(gateway *g, int listen_fd, bool is_admin) {
     for (;;) {
-        int cfd = accept(listen_fd, NULL, NULL);
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof ss;
+        int cfd = accept(listen_fd, (struct sockaddr *)&ss, &sl);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -640,6 +675,10 @@ static void accept_conns(gateway *g, int listen_fd, bool is_admin) {
         conn *c = conn_new(g, cfd);
         if (!c) { close(cfd); continue; }
         c->is_admin = is_admin;
+        if (ss.ss_family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, c->client_ip, sizeof c->client_ip);
+        else if (ss.ss_family == AF_INET6)
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, c->client_ip, sizeof c->client_ip);
         if (ntc_poller_add(g->p, cfd, NTC_POLL_READ, c) != NTC_OK) {
             ntc_arena_destroy(&c->arena); close(cfd); free(c);
         }
@@ -1068,6 +1107,27 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
             snprintf(g.app_name, sizeof g.app_name, "%s", e ? e : "naitron-c app");
         }
     }
+    {
+        ntc_mw_config mcfg;
+        memset(&mcfg, 0, sizeof mcfg);
+        mcfg.request_id = true;
+        mcfg.access_log = true;
+        char v[256]; bool f = false;
+        if (ntc_registry_get_config(g.reg, "cors.origin", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.cors_origin, sizeof mcfg.cors_origin, "%s", v);
+        if (ntc_registry_get_config(g.reg, "ratelimit.per_sec", v, sizeof v, &f) == NTC_OK && f)
+            mcfg.rate_per_sec = atoi(v);
+        if (ntc_registry_get_config(g.reg, "ratelimit.burst", v, sizeof v, &f) == NTC_OK && f)
+            mcfg.rate_burst = atoi(v);
+        if (ntc_registry_get_config(g.reg, "accesslog", v, sizeof v, &f) == NTC_OK && f)
+            mcfg.access_log = atoi(v) != 0;
+        /* env overrides (handy for ops/tests) */
+        const char *e;
+        if ((e = getenv("NTC_CORS_ORIGIN"))) snprintf(mcfg.cors_origin, sizeof mcfg.cors_origin, "%s", e);
+        if ((e = getenv("NTC_RATELIMIT_PER_SEC"))) mcfg.rate_per_sec = atoi(e);
+        if ((e = getenv("NTC_RATELIMIT_BURST"))) mcfg.rate_burst = atoi(e);
+        g.mw = ntc_mw_new(&mcfg);
+    }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
@@ -1185,12 +1245,14 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     close(listen_fd);
     if (g.admin_fd >= 0) close(g.admin_fd);
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
+    ntc_mw_free(g.mw);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_OK;
 
 fail_pre_poll:
     free(g.services);
+    ntc_mw_free(g.mw);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_ERR_IO;

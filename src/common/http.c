@@ -27,19 +27,27 @@ const char *ntc_http_status_text(int status) {
 ntc_err ntc_http_format_response(ntc_arena *a, int status, const char *status_text,
                                  ntc_slice content_type, ntc_slice body,
                                  ntc_slice *out) {
+    return ntc_http_format_response_ex(a, status, status_text, content_type, NULL, body, out);
+}
+
+ntc_err ntc_http_format_response_ex(ntc_arena *a, int status, const char *status_text,
+                                    ntc_slice content_type, const char *extra_headers,
+                                    ntc_slice body, ntc_slice *out) {
     if (!a || !status_text || !out) return NTC_ERR_INVALID;
 
-    char header[512];
+    char header[1024];
     int n = snprintf(header, sizeof header,
         "HTTP/1.1 %d %s\r\n"
         "Server: " NTC_NAME "/" NTC_VERSION "\r\n"
         "Content-Type: %.*s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
+        "%s"
         "\r\n",
         status, status_text,
         (int)content_type.len, content_type.ptr,
-        body.len);
+        body.len,
+        extra_headers ? extra_headers : "");
     if (n < 0 || (size_t)n >= sizeof header) return NTC_ERR_OVERFLOW;
 
     size_t total;

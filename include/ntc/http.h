@@ -60,4 +60,10 @@ NTC_NODISCARD ntc_err ntc_http_format_response(ntc_arena *a, int status,
         const char *status_text, ntc_slice content_type, ntc_slice body,
         ntc_slice *out);
 
+/* Like the above, plus `extra_headers` (complete "Name: value\r\n" lines, or
+ * NULL) inserted before the blank line - for middleware-added headers. */
+NTC_NODISCARD ntc_err ntc_http_format_response_ex(ntc_arena *a, int status,
+        const char *status_text, ntc_slice content_type, const char *extra_headers,
+        ntc_slice body, ntc_slice *out);
+
 #endif /* NTC_HTTP_H */
