@@ -5,12 +5,15 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **M1 — UX/DX pass complete** (on top of feature-complete P1–P8).
-> Detached daemon mode (`-d`, PID file, `stop`/`restart`/`logs`), CLI-native
-> output (`--json`), dashboard **on by default** at http://127.0.0.1:9090,
-> reserved `/_ntc/health|ready|metrics`, a friendly public `/` landing, and a
-> built-in **MCP-over-HTTP** transport at `/_ntc/mcp` plus the `ntc mcp` stdio
-> adapter. See `docs/SPEC.md` for the M1–M6 roadmap.
+> Status: **M1–M6 implemented** (on top of feature-complete P1–P8). UX/DX
+> (detached daemon, formatted CLI, dashboard-by-default, `/_ntc/*`, MCP-over-HTTP);
+> a **middleware** chain (request-id, access-log, CORS, rate-limit); **auth**
+> (API keys + HS256 JWT, crypto from scratch verified against RFC vectors);
+> **controller DX** (path params + query + auth identity over the frozen v2 wire,
+> `ntc_reply_json`, `ntc new controller`); **SDKs in Python, TypeScript, Go, Rust**
+> (`sdk/`); **static file serving** + **auto-OpenAPI** (`/_ntc/openapi.json`).
+> Deferred (need BearSSL or streaming conns): RS256/OAuth-login, TLS, SSE, gzip,
+> `ntc dev`, worker pools — see `docs/DECISIONS.md`. Roadmap: `docs/SPEC.md`.
 
 ## CLI
 

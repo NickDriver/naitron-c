@@ -12,9 +12,11 @@
 #include "ntc/registry.h"
 #include "ntc/router.h"
 #include "ntc/slice.h"
+#include "ntc/version.h"
 #include "ntc/wire.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -24,6 +26,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -137,6 +140,7 @@ typedef struct gateway {
     ntc_mw *mw;
     char token[65];
     char app_name[128];
+    char static_dir[256]; /* serve files from here when no route matches ("" = off) */
     service *services;   /* fixed array, cap NTC_MAX_SERVICES (stable pointers) */
     size_t nservices;
     conn *pending[NTC_MAX_INFLIGHT];
@@ -408,6 +412,93 @@ static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc)
     return 0;
 }
 
+static const char *mime_for(const char *path) {
+    const char *d = strrchr(path, '.');
+    if (!d) return "application/octet-stream";
+    if (!strcmp(d, ".html") || !strcmp(d, ".htm")) return "text/html; charset=utf-8";
+    if (!strcmp(d, ".css")) return "text/css";
+    if (!strcmp(d, ".js") || !strcmp(d, ".mjs")) return "application/javascript";
+    if (!strcmp(d, ".json")) return "application/json";
+    if (!strcmp(d, ".svg")) return "image/svg+xml";
+    if (!strcmp(d, ".png")) return "image/png";
+    if (!strcmp(d, ".jpg") || !strcmp(d, ".jpeg")) return "image/jpeg";
+    if (!strcmp(d, ".ico")) return "image/x-icon";
+    if (!strcmp(d, ".txt")) return "text/plain; charset=utf-8";
+    if (!strcmp(d, ".wasm")) return "application/wasm";
+    return "application/octet-stream";
+}
+
+/* 2 = not served (fall through); 0/-1 = served (alive/closed). */
+static int serve_static(gateway *g, conn *c, const ntc_request *req) {
+    if (!g->static_dir[0] || !ntc_slice_eq_cstr(req->method, "GET")) return 2;
+
+    char rel[512];
+    if (req->path.len <= 1) {
+        snprintf(rel, sizeof rel, "index.html");
+    } else {
+        const char *p = req->path.ptr + 1;
+        size_t n = req->path.len - 1;
+        if (n >= sizeof rel - 12) return 2;
+        for (size_t i = 0; i < n; i++)
+            if (p[i] == '\0' || (p[i] == '.' && i + 1 < n && p[i + 1] == '.')) return 2; /* no traversal */
+        memcpy(rel, p, n);
+        rel[n] = '\0';
+        if (rel[n - 1] == '/') snprintf(rel + n, sizeof rel - n, "index.html");
+    }
+
+    char full[800];
+    snprintf(full, sizeof full, "%s/%s", g->static_dir, rel);
+    int fd = open(full, O_RDONLY);
+    if (fd < 0) return 2;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > 10 * 1024 * 1024) { close(fd); return 2; }
+    size_t sz = (size_t)st.st_size;
+    char *buf = ntc_arena_alloc(&c->arena, sz ? sz : 1);
+    if (!buf) { close(fd); return 2; }
+    size_t got = 0;
+    while (got < sz) { ssize_t r = read(fd, buf + got, sz - got); if (r <= 0) break; got += (size_t)r; }
+    close(fd);
+    if (got != sz) return 2;
+    return send_resp(g, c, 200, ntc_slice_cstr(mime_for(rel)), ntc_slice_new(buf, sz));
+}
+
+/* Generate a basic OpenAPI 3.0 spec from the registry routes. */
+static int serve_openapi(gateway *g, conn *c) {
+    ntc_route_row rows[256];
+    size_t n = 0;
+    (void)ntc_registry_list_routes(g->reg, rows, 256, &n);
+    size_t cap = 64 * 1024;
+    char *buf = ntc_arena_alloc(&c->arena, cap);
+    if (!buf) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
+    size_t off = (size_t)snprintf(buf, cap,
+        "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"%s\",\"version\":\"%s\"},\"paths\":{",
+        g->app_name, NTC_VERSION);
+    for (size_t i = 0; i < n && off < cap - 512; i++) {
+        char path[160];
+        size_t pj = 0, plen = strlen(rows[i].pattern);
+        for (size_t k = 0; k < plen && pj < sizeof path - 2; k++) {
+            if (rows[i].pattern[k] == ':') {           /* :id -> {id} */
+                path[pj++] = '{';
+                k++;
+                while (k < plen && rows[i].pattern[k] != '/' && pj < sizeof path - 2) path[pj++] = rows[i].pattern[k++];
+                path[pj++] = '}';
+                k--;
+            } else {
+                path[pj++] = rows[i].pattern[k];
+            }
+        }
+        path[pj] = '\0';
+        char m[8];
+        snprintf(m, sizeof m, "%s", rows[i].method);
+        for (char *q = m; *q; q++) *q = (char)tolower((unsigned char)*q);
+        off += (size_t)snprintf(buf + off, cap - off,
+            "%s\"%s\":{\"%s\":{\"summary\":\"-> %s\",\"responses\":{\"200\":{\"description\":\"OK\"}}}}",
+            i ? "," : "", path, m, rows[i].service);
+    }
+    off += (size_t)snprintf(buf + off, cap - off, "}}");
+    return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
+}
+
 static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     /* reserved framework namespace - never overridable by user routes */
     if (ntc_slice_starts_with(req->path, NTC_SLICE_LIT("/_ntc/"))) {
@@ -415,6 +506,8 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
             return send_resp(g, c, 200, JSON, NTC_SLICE_LIT("{\"status\":\"ok\"}"));
         if (ntc_slice_eq_cstr(req->path, "/_ntc/ready"))
             return send_resp(g, c, 200, JSON, NTC_SLICE_LIT("{\"status\":\"ready\"}"));
+        if (ntc_slice_eq_cstr(req->path, "/_ntc/openapi.json"))
+            return serve_openapi(g, c);
         return send_resp(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
     }
 
@@ -424,6 +517,9 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     ntc_route_status rs = ntc_router_match(g->router, req->method, req->path, &h, &udata, &params);
 
     if (rs == NTC_ROUTE_NOT_FOUND) {
+        /* try static files before falling back */
+        int sr = serve_static(g, c, req);
+        if (sr != 2) return sr;
         /* friendly landing on "/" when no user route claims it */
         if (ntc_slice_eq_cstr(req->path, "/")) {
             char *buf = ntc_arena_alloc(&c->arena, 1024);
@@ -1122,6 +1218,11 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
             const char *e = getenv("NTC_APP_NAME");
             snprintf(g.app_name, sizeof g.app_name, "%s", e ? e : "naitron-c app");
         }
+        char sd[256]; bool sf = false;
+        if (ntc_registry_get_config(g.reg, "static.dir", sd, sizeof sd, &sf) == NTC_OK && sf)
+            snprintf(g.static_dir, sizeof g.static_dir, "%s", sd);
+        const char *se = getenv("NTC_STATIC_DIR");
+        if (se) snprintf(g.static_dir, sizeof g.static_dir, "%s", se);
     }
     {
         ntc_mw_config mcfg;
