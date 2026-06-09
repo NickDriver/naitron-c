@@ -10,12 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Isolate each test: unique db/socket/token under /tmp, seeded controller. */
 static void iso_env(const char *tag) {
-    char p[256];
-    snprintf(p, sizeof p, "/tmp/ntc_it_%s.db", tag);     setenv("NTC_DB", p, 1); unlink(p);
-    snprintf(p, sizeof p, "/tmp/ntc_it_%s.sock", tag);    setenv("NTC_CONTROL_SOCK", p, 1); unlink(p);
-    snprintf(p, sizeof p, "/tmp/ntc_it_%s.token", tag);   setenv("NTC_TOKEN_FILE", p, 1); unlink(p);
+    it_iso(tag);
     setenv("NTC_CONTROLLER_BIN", "./build/hello_controller", 1);
 }
 
@@ -28,7 +24,7 @@ static int body_pid(const char *resp) {
 
 ITEST(gateway, answers_200_over_tcp) {
     iso_env("p200");
-    const char *argv[] = { "./build/ntc", "start", "38081", NULL };
+    const char *argv[] = { "./build/ntc", "start", "38081", "--no-dashboard", NULL };
     pid_t srv = it_spawn(argv);
     ASSERT_TRUE(srv > 0);
     ASSERT_TRUE(it_wait_port(38081, 4000));
@@ -46,7 +42,7 @@ ITEST(gateway, answers_200_over_tcp) {
 
 ITEST(gateway, forwards_request_to_controller) {
     iso_env("fwd");
-    const char *argv[] = { "./build/ntc", "start", "38082", NULL };
+    const char *argv[] = { "./build/ntc", "start", "38082", "--no-dashboard", NULL };
     pid_t srv = it_spawn(argv);
     ASSERT_TRUE(srv > 0);
     ASSERT_TRUE(it_wait_port(38082, 4000));
@@ -62,7 +58,7 @@ ITEST(gateway, forwards_request_to_controller) {
 
 ITEST(gateway, restarts_crashed_controller) {
     iso_env("restart");
-    const char *argv[] = { "./build/ntc", "start", "38083", NULL };
+    const char *argv[] = { "./build/ntc", "start", "38083", "--no-dashboard", NULL };
     pid_t srv = it_spawn(argv);
     ASSERT_TRUE(srv > 0);
     ASSERT_TRUE(it_wait_port(38083, 4000));

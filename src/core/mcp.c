@@ -8,6 +8,7 @@
 #include "ntc/version.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TOOLS_JSON =
@@ -32,15 +33,13 @@ static void write_id(FILE *o, const ntc_json *id) {
 static void reply_result(FILE *o, const ntc_json *id, const char *result_json) {
     fputs("{\"jsonrpc\":\"2.0\",\"id\":", o);
     write_id(o, id);
-    fprintf(o, ",\"result\":%s}\n", result_json);
-    fflush(o);
+    fprintf(o, ",\"result\":%s}", result_json);
 }
 
 static void reply_error(FILE *o, const ntc_json *id, int code, const char *msg) {
     fputs("{\"jsonrpc\":\"2.0\",\"id\":", o);
     write_id(o, id);
-    fprintf(o, ",\"error\":{\"code\":%d,\"message\":\"%s\"}}\n", code, msg);
-    fflush(o);
+    fprintf(o, ",\"error\":{\"code\":%d,\"message\":\"%s\"}}", code, msg);
 }
 
 static void reply_content(FILE *o, const ntc_json *id, const char *text, bool is_error) {
@@ -48,12 +47,10 @@ static void reply_content(FILE *o, const ntc_json *id, const char *text, bool is
     if (ntc_json_escape(esc, sizeof esc, ntc_slice_cstr(text)) < 0) esc[0] = '\0';
     fputs("{\"jsonrpc\":\"2.0\",\"id\":", o);
     write_id(o, id);
-    fprintf(o, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],\"isError\":%s}}\n",
+    fprintf(o, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],\"isError\":%s}}",
             esc, is_error ? "true" : "false");
-    fflush(o);
 }
 
-/* Pull a control-safe string arg (no spaces/newlines) from arguments. */
 static bool arg_str(const ntc_json *args, const char *key, char *buf, size_t cap) {
     ntc_slice s = ntc_json_str(ntc_json_get(args, key));
     if (s.len == 0 || s.len >= cap) return false;
@@ -64,7 +61,8 @@ static bool arg_str(const ntc_json *args, const char *key, char *buf, size_t cap
     return true;
 }
 
-static void handle_tool_call(FILE *o, const ntc_json *id, const ntc_json *params) {
+static void handle_tool_call(FILE *o, const ntc_json *id, const ntc_json *params,
+                             ntc_mcp_exec_fn exec, void *ctx) {
     ntc_slice name = ntc_json_str(ntc_json_get(params, "name"));
     const ntc_json *args = ntc_json_get(params, "arguments");
     char command[1024], a[256], b[256], c[256];
@@ -91,34 +89,27 @@ static void handle_tool_call(FILE *o, const ntc_json *id, const ntc_json *params
         return;
     }
 
-    char token[65];
-    if (ntc_control_read_token(token, sizeof token) != NTC_OK) {
-        reply_content(o, id, "no control token found (is the core running?)", true);
-        return;
-    }
-    char out[8192];
-    if (ntc_control_call(ntc_control_sock_path(), token, command, out, sizeof out) != NTC_OK) {
-        reply_content(o, id, "cannot reach the core control socket", true);
-        return;
-    }
-    size_t n = strlen(out);
-    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
-    reply_content(o, id, out, strncmp(out, "OK", 2) != 0);
+    char raw[8192];
+    raw[0] = '\0';
+    exec(ctx, command, raw, sizeof raw);
+    size_t n = strlen(raw);
+    while (n && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) raw[--n] = '\0';
+    reply_content(o, id, raw, strncmp(raw, "OK", 2) != 0);
 }
 
-int ntc_mcp_run(void) {
-    static char line[65536];
-    FILE *o = stdout;
+void ntc_mcp_handle(const char *msg, size_t len, ntc_mcp_exec_fn exec, void *ctx,
+                    char *out, size_t out_cap) {
+    if (out_cap) out[0] = '\0';
 
-    while (fgets(line, sizeof line, stdin)) {
-        size_t len = strlen(line);
-        if (len == 0) continue;
+    char *mem = NULL;
+    size_t memsz = 0;
+    FILE *o = open_memstream(&mem, &memsz);
+    if (!o) return;
 
-        ntc_arena a;
-        if (ntc_arena_init(&a, 64 * 1024) != NTC_OK) break;
-        ntc_json *root = ntc_json_parse(&a, line, len);
-        if (!root || root->type != NTC_JSON_OBJ) { ntc_arena_destroy(&a); continue; }
-
+    ntc_arena a;
+    if (ntc_arena_init(&a, 64 * 1024) != NTC_OK) { fclose(o); free(mem); return; }
+    ntc_json *root = ntc_json_parse(&a, msg, len);
+    if (root && root->type == NTC_JSON_OBJ) {
         ntc_slice method = ntc_json_str(ntc_json_get(root, "method"));
         const ntc_json *id = ntc_json_get(root, "id");
 
@@ -131,7 +122,7 @@ int ntc_mcp_run(void) {
             snprintf(buf, sizeof buf, "{\"tools\":%s}", TOOLS_JSON);
             reply_result(o, id, buf);
         } else if (ntc_slice_eq_cstr(method, "tools/call")) {
-            handle_tool_call(o, id, ntc_json_get(root, "params"));
+            handle_tool_call(o, id, ntc_json_get(root, "params"), exec, ctx);
         } else if (ntc_slice_eq_cstr(method, "ping")) {
             reply_result(o, id, "{}");
         } else if (ntc_slice_eq_cstr(method, "notifications/initialized")) {
@@ -139,7 +130,45 @@ int ntc_mcp_run(void) {
         } else if (id) {
             reply_error(o, id, -32601, "method not found");
         }
-        ntc_arena_destroy(&a);
+    }
+    ntc_arena_destroy(&a);
+    fclose(o);
+    snprintf(out, out_cap, "%s", mem ? mem : "");
+    free(mem);
+}
+
+/* stdio adapter executor: talk to the running core over the control socket. */
+static void stdio_exec(void *ctx, const char *command, char *out, size_t cap) {
+    (void)ctx;
+    char token[65];
+    if (ntc_control_read_token(token, sizeof token) != NTC_OK) {
+        snprintf(out, cap, "ERR no control token found (is the core running?)");
+        return;
+    }
+    if (ntc_control_call(ntc_control_sock_path(), token, command, out, cap) != NTC_OK)
+        snprintf(out, cap, "ERR cannot reach the core control socket");
+}
+
+int ntc_mcp_run(void) {
+    static char line[65536];
+    fprintf(stderr, "naitron-c MCP server on stdio (core: %s)\n", ntc_control_sock_path());
+    while (fgets(line, sizeof line, stdin)) {
+        size_t len = strlen(line);
+        if (len == 0) continue;
+        char out[32768];
+        ntc_mcp_handle(line, len, stdio_exec, NULL, out, sizeof out);
+        if (out[0]) { fputs(out, stdout); fputc('\n', stdout); fflush(stdout); }
     }
     return 0;
+}
+
+void ntc_mcp_print_tools(int json) {
+    if (json) { printf("%s\n", TOOLS_JSON); return; }
+    printf("naitron-c MCP tools:\n");
+    printf("  naitron_status            core status\n");
+    printf("  naitron_list_services     list services\n");
+    printf("  naitron_list_routes       list routes\n");
+    printf("  naitron_add_service       {name, bin}        register + spawn a controller (live)\n");
+    printf("  naitron_add_route         {method, pattern, service}   route to a service (live)\n");
+    printf("  naitron_remove_service    {name}             remove a service\n");
 }

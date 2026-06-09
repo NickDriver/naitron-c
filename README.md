@@ -5,13 +5,12 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P8 — feature-complete (P1–P8).** A read-only dashboard + metrics
-> serve on a localhost-only admin port (`ntc start 3000 --admin 9000`, then open
-> http://127.0.0.1:9000): live request/status counts, per-service up/down status
-> and restarts, and routes. The full stack: event loop (P1), HTTP parser (P2),
-> router (P3), IPC + Controller SDK (P4), orchestrator with supervision + SQLite
-> registry (P5), authenticated control plane + CLI (P6), built-in MCP server (P7),
-> dashboard (P8).
+> Status: **M1 — UX/DX pass complete** (on top of feature-complete P1–P8).
+> Detached daemon mode (`-d`, PID file, `stop`/`restart`/`logs`), CLI-native
+> output (`--json`), dashboard **on by default** at http://127.0.0.1:9090,
+> reserved `/_ntc/health|ready|metrics`, a friendly public `/` landing, and a
+> built-in **MCP-over-HTTP** transport at `/_ntc/mcp` plus the `ntc mcp` stdio
+> adapter. See `docs/SPEC.md` for the M1–M6 roadmap.
 
 ## CLI
 

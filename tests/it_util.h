@@ -27,4 +27,8 @@ int it_status(const char *resp);
 /* SIGTERM the child and reap it. */
 void it_stop(pid_t pid);
 
+/* Set isolated temp env (NTC_DB/CONTROL_SOCK/TOKEN_FILE/PID_FILE/LOG_FILE) under
+ * /tmp/ntc_it_<tag>.* and remove any stale files. */
+void it_iso(const char *tag);
+
 #endif /* NTC_IT_UTIL_H */

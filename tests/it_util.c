@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -85,6 +86,18 @@ int it_status(const char *resp) {
     int code = 0;
     if (sscanf(resp, "HTTP/1.%*d %d", &code) == 1) return code;
     return -1;
+}
+
+void it_iso(const char *tag) {
+    char p[256];
+    const char *vars[] = { "NTC_DB", "NTC_CONTROL_SOCK", "NTC_TOKEN_FILE",
+                           "NTC_PID_FILE", "NTC_LOG_FILE" };
+    const char *ext[] = { "db", "sock", "token", "pid", "log" };
+    for (int i = 0; i < 5; i++) {
+        snprintf(p, sizeof p, "/tmp/ntc_it_%s.%s", tag, ext[i]);
+        setenv(vars[i], p, 1);
+        unlink(p);
+    }
 }
 
 void it_stop(pid_t pid) {

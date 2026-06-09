@@ -6,6 +6,7 @@
 #include "ntc/control.h"
 #include "ntc/http.h"
 #include "ntc/log.h"
+#include "ntc/mcp.h"
 #include "ntc/poller.h"
 #include "ntc/registry.h"
 #include "ntc/router.h"
@@ -122,6 +123,7 @@ typedef struct gateway {
     int control_fd;
     metrics m;
     char token[65];
+    char app_name[128];
     service *services;   /* fixed array, cap NTC_MAX_SERVICES (stable pointers) */
     size_t nservices;
     conn *pending[NTC_MAX_INFLIGHT];
@@ -136,6 +138,7 @@ static int  on_writable(gateway *g, conn *c);
 static int  respond_and_flush(gateway *g, conn *c, int status, ntc_slice json);
 static void controller_died(gateway *g, ctrl *ct);
 static int  spawn_service(gateway *g, service *svc);
+static void exec_control_command(gateway *g, char *cmdline, char *out, size_t cap);
 
 /* ---- utilities ---- */
 static int set_nonblocking(int fd) {
@@ -228,6 +231,12 @@ static int conn_flush(gateway *g, conn *c) {
 static int respond_and_flush(gateway *g, conn *c, int status, ntc_slice json) {
     if (!c->is_admin) rec_status(g, status);
     if (conn_respond(c, status, JSON, json) != 0) { conn_close(g, c); return -1; }
+    return conn_flush(g, c);
+}
+
+/* respond without touching request metrics (reserved endpoints, admin, landing) */
+static int send_resp(gateway *g, conn *c, int status, ntc_slice ctype, ntc_slice body) {
+    if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return -1; }
     return conn_flush(g, c);
 }
 
@@ -380,13 +389,40 @@ static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc)
 }
 
 static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
+    /* reserved framework namespace - never overridable by user routes */
+    if (ntc_slice_starts_with(req->path, NTC_SLICE_LIT("/_ntc/"))) {
+        if (ntc_slice_eq_cstr(req->path, "/_ntc/health"))
+            return send_resp(g, c, 200, JSON, NTC_SLICE_LIT("{\"status\":\"ok\"}"));
+        if (ntc_slice_eq_cstr(req->path, "/_ntc/ready"))
+            return send_resp(g, c, 200, JSON, NTC_SLICE_LIT("{\"status\":\"ready\"}"));
+        return send_resp(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
+    }
+
     ntc_handler h = NULL;
     void *udata = NULL;
     ntc_route_params params;
     ntc_route_status rs = ntc_router_match(g->router, req->method, req->path, &h, &udata, &params);
 
-    if (rs == NTC_ROUTE_NOT_FOUND)
+    if (rs == NTC_ROUTE_NOT_FOUND) {
+        /* friendly landing on "/" when no user route claims it */
+        if (ntc_slice_eq_cstr(req->path, "/")) {
+            char *buf = ntc_arena_alloc(&c->arena, 1024);
+            if (buf) {
+                long up = (now_ms() - g->m.start_ms) / 1000;
+                int m = snprintf(buf, 1024,
+                    "<!doctype html><meta charset=utf-8><title>%s</title>"
+                    "<body style='font-family:system-ui;background:#0e1116;color:#e6edf3;"
+                    "display:flex;height:90vh;align-items:center;justify-content:center;flex-direction:column'>"
+                    "<h1 style='margin:0'>%s</h1>"
+                    "<p style='color:#9aa7b3'>powered by naitron-c &middot; core uptime %lds</p></body>",
+                    g->app_name, g->app_name, up);
+                if (m > 0)
+                    return send_resp(g, c, 200, NTC_SLICE_LIT("text/html; charset=utf-8"),
+                                     ntc_slice_new(buf, (size_t)m));
+            }
+        }
         return respond_and_flush(g, c, 404, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
+    }
     if (rs == NTC_ROUTE_METHOD_NOT_ALLOWED)
         return respond_and_flush(g, c, 405, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
     if (h == forward_marker) { g->m.forwarded++; return gw_forward(g, c, req, (service *)udata); }
@@ -441,22 +477,39 @@ static const char *DASHBOARD_HTML =
 "tick();setInterval(tick,1500);\n"
 "</script></body></html>\n";
 
-static int admin_send(gateway *g, conn *c, int status, ntc_slice ctype, ntc_slice body) {
-    if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return -1; }
-    return conn_flush(g, c);
+static void incore_mcp_exec(void *ctx, const char *command, char *out, size_t cap) {
+    gateway *g = ctx;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", command);
+    exec_control_command(g, buf, out, cap);
 }
 
 static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
+    /* MCP over HTTP (console port = localhost, token-authenticated) */
+    if (ntc_slice_eq_cstr(req->path, "/_ntc/mcp")) {
+        if (!ntc_slice_eq_cstr(req->method, "POST"))
+            return send_resp(g, c, 405, JSON, NTC_SLICE_LIT("{\"error\":\"POST only\"}"));
+        ntc_slice auth = ntc_http_header(req, "authorization");
+        bool ok = auth.len > 7 && memcmp(auth.ptr, "Bearer ", 7) == 0 &&
+                  ntc_slice_eq_cstr(ntc_slice_new(auth.ptr + 7, auth.len - 7), g->token);
+        if (!ok) return send_resp(g, c, 401, JSON, NTC_SLICE_LIT("{\"error\":\"unauthorized\"}"));
+        char *out = ntc_arena_alloc(&c->arena, 32 * 1024);
+        if (!out) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
+        ntc_mcp_handle(req->body.ptr, req->body.len, incore_mcp_exec, g, out, 32 * 1024);
+        if (out[0] == '\0') return send_resp(g, c, 202, JSON, NTC_SLICE_LIT(""));
+        return send_resp(g, c, 200, JSON, ntc_slice_new(out, strlen(out)));
+    }
+
     if (!ntc_slice_eq_cstr(req->method, "GET"))
-        return admin_send(g, c, 405, JSON, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
+        return send_resp(g, c, 405, JSON, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
 
     if (ntc_slice_eq_cstr(req->path, "/") || ntc_slice_eq_cstr(req->path, "/index.html"))
-        return admin_send(g, c, 200, NTC_SLICE_LIT("text/html; charset=utf-8"),
+        return send_resp(g, c, 200, NTC_SLICE_LIT("text/html; charset=utf-8"),
                           ntc_slice_cstr(DASHBOARD_HTML));
 
     if (ntc_slice_eq_cstr(req->path, "/api/stats")) {
         char *buf = ntc_arena_alloc(&c->arena, 1024);
-        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
+        if (!buf) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
         long up = (now_ms() - g->m.start_ms) / 1000;
         int m = snprintf(buf, 1024,
             "{\"uptime_s\":%ld,\"requests_total\":%llu,\"status_2xx\":%llu,\"status_4xx\":%llu,"
@@ -466,13 +519,13 @@ static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
             (unsigned long long)g->m.status_4xx, (unsigned long long)g->m.status_5xx,
             (unsigned long long)g->m.forwarded, (unsigned long long)g->m.builtin,
             g->nservices, ntc_router_count(g->router), ntc_poller_backend(), NTC_MAX_INFLIGHT);
-        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, (size_t)(m < 0 ? 0 : m)));
+        return send_resp(g, c, 200, JSON, ntc_slice_new(buf, (size_t)(m < 0 ? 0 : m)));
     }
 
     if (ntc_slice_eq_cstr(req->path, "/api/services")) {
         size_t cap = 64 * 1024;
         char *buf = ntc_arena_alloc(&c->arena, cap);
-        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
+        if (!buf) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
         long t = now_ms();
         size_t off = (size_t)snprintf(buf, cap, "[");
         for (size_t i = 0; i < g->nservices && off < cap - 512; i++) {
@@ -484,7 +537,7 @@ static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
                 i ? "," : "", svc->name, svc->bin, st, svc->restart_count, up);
         }
         off += (size_t)snprintf(buf + off, cap - off, "]");
-        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, off));
+        return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
     }
 
     if (ntc_slice_eq_cstr(req->path, "/api/routes")) {
@@ -492,17 +545,37 @@ static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
         (void)ntc_registry_list_routes(g->reg, rows, 256, &n);
         size_t cap = 64 * 1024;
         char *buf = ntc_arena_alloc(&c->arena, cap);
-        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
+        if (!buf) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
         size_t off = (size_t)snprintf(buf, cap, "[");
         for (size_t i = 0; i < n && off < cap - 512; i++)
             off += (size_t)snprintf(buf + off, cap - off,
                 "%s{\"method\":\"%s\",\"pattern\":\"%s\",\"service\":\"%s\"}",
                 i ? "," : "", rows[i].method, rows[i].pattern, rows[i].service);
         off += (size_t)snprintf(buf + off, cap - off, "]");
-        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, off));
+        return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
     }
 
-    return admin_send(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
+    if (ntc_slice_eq_cstr(req->path, "/_ntc/metrics") || ntc_slice_eq_cstr(req->path, "/metrics")) {
+        char *buf = ntc_arena_alloc(&c->arena, 2048);
+        if (!buf) return send_resp(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
+        long up = (now_ms() - g->m.start_ms) / 1000;
+        int m = snprintf(buf, 2048,
+            "# HELP ntc_requests_total total HTTP requests\n# TYPE ntc_requests_total counter\n"
+            "ntc_requests_total %llu\n"
+            "ntc_responses_total{class=\"2xx\"} %llu\n"
+            "ntc_responses_total{class=\"4xx\"} %llu\n"
+            "ntc_responses_total{class=\"5xx\"} %llu\n"
+            "ntc_forwarded_total %llu\nntc_builtin_total %llu\n"
+            "ntc_services %zu\nntc_uptime_seconds %ld\n",
+            (unsigned long long)g->m.requests_total, (unsigned long long)g->m.status_2xx,
+            (unsigned long long)g->m.status_4xx, (unsigned long long)g->m.status_5xx,
+            (unsigned long long)g->m.forwarded, (unsigned long long)g->m.builtin,
+            g->nservices, up);
+        return send_resp(g, c, 200, NTC_SLICE_LIT("text/plain; version=0.0.4"),
+                         ntc_slice_new(buf, (size_t)(m < 0 ? 0 : m)));
+    }
+
+    return send_resp(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
 }
 
 static int on_readable(gateway *g, conn *c) {
@@ -828,44 +901,45 @@ static void cctrl_reply(gateway *g, cctrl *cc, const char *msg) {
     free(cc);
 }
 
-static void process_control(gateway *g, cctrl *cc) {
-    char *nl = memchr(cc->buf, '\n', cc->len);
-    if (nl) *nl = '\0'; else cc->buf[cc->len < sizeof cc->buf ? cc->len : sizeof cc->buf - 1] = '\0';
-
+/* Execute a control command (token already verified). Writes a reply line
+ * (OK.../ERR...) to out. Callable from the control socket AND the in-core MCP. */
+static void exec_control_command(gateway *g, char *cmdline, char *out, size_t cap) {
     char *save = NULL;
-    char *tok = strtok_r(cc->buf, " ", &save);
-    char *cmd = tok ? strtok_r(NULL, " ", &save) : NULL;
-    if (!tok || strcmp(tok, g->token) != 0) { cctrl_reply(g, cc, "ERR unauthorized\n"); return; }
-    if (!cmd) { cctrl_reply(g, cc, "ERR empty command\n"); return; }
+    char *cmd = strtok_r(cmdline, " ", &save);
+    if (!cmd) { snprintf(out, cap, "ERR empty command\n"); return; }
 
-    char out[8192];
     if (strcmp(cmd, "ping") == 0) {
-        cctrl_reply(g, cc, "OK pong\n");
+        snprintf(out, cap, "OK pong\n");
     } else if (strcmp(cmd, "status") == 0) {
-        snprintf(out, sizeof out,
-            "OK {\"services\":%zu,\"routes\":%zu,\"backend\":\"%s\",\"inflight_cap\":%u}\n",
-            g->nservices, ntc_router_count(g->router), ntc_poller_backend(), NTC_MAX_INFLIGHT);
-        cctrl_reply(g, cc, out);
+        long up = (now_ms() - g->m.start_ms) / 1000;
+        snprintf(out, cap,
+            "OK {\"app\":\"%s\",\"uptime_s\":%ld,\"services\":%zu,\"routes\":%zu,"
+            "\"backend\":\"%s\",\"requests\":%llu,\"status_2xx\":%llu,\"status_4xx\":%llu,"
+            "\"status_5xx\":%llu,\"forwarded\":%llu,\"builtin\":%llu,\"inflight_cap\":%u}\n",
+            g->app_name, up, g->nservices, ntc_router_count(g->router), ntc_poller_backend(),
+            (unsigned long long)g->m.requests_total, (unsigned long long)g->m.status_2xx,
+            (unsigned long long)g->m.status_4xx, (unsigned long long)g->m.status_5xx,
+            (unsigned long long)g->m.forwarded, (unsigned long long)g->m.builtin, NTC_MAX_INFLIGHT);
     } else if (strcmp(cmd, "service-add") == 0) {
         char *name = strtok_r(NULL, " ", &save);
         char *bin = strtok_r(NULL, " ", &save);
-        if (!name || !bin) { cctrl_reply(g, cc, "ERR usage: service-add <name> <bin>\n"); return; }
-        if (ntc_registry_add_service(g->reg, name, bin) != NTC_OK) { cctrl_reply(g, cc, "ERR registry write failed\n"); return; }
-        if (!service_add_live(g, name, bin)) { cctrl_reply(g, cc, "ERR too many services\n"); return; }
-        cctrl_reply(g, cc, "OK service added\n");
+        if (!name || !bin) { snprintf(out, cap, "ERR usage: service-add <name> <bin>\n"); return; }
+        if (ntc_registry_add_service(g->reg, name, bin) != NTC_OK) { snprintf(out, cap, "ERR registry write failed\n"); return; }
+        if (!service_add_live(g, name, bin)) { snprintf(out, cap, "ERR too many services\n"); return; }
+        snprintf(out, cap, "OK service added\n");
     } else if (strcmp(cmd, "route-add") == 0) {
         char *method = strtok_r(NULL, " ", &save);
         char *pattern = strtok_r(NULL, " ", &save);
         char *svcname = strtok_r(NULL, " ", &save);
-        if (!method || !pattern || !svcname) { cctrl_reply(g, cc, "ERR usage: route-add <METHOD> <pattern> <service>\n"); return; }
-        if (ntc_registry_add_route(g->reg, method, pattern, svcname) != NTC_OK) { cctrl_reply(g, cc, "ERR unknown service\n"); return; }
+        if (!method || !pattern || !svcname) { snprintf(out, cap, "ERR usage: route-add <METHOD> <pattern> <service>\n"); return; }
+        if (ntc_registry_add_route(g->reg, method, pattern, svcname) != NTC_OK) { snprintf(out, cap, "ERR unknown service\n"); return; }
         service *svc = find_service(g, svcname);
-        if (!svc) { cctrl_reply(g, cc, "ERR service not loaded\n"); return; }
-        if (ntc_router_add(g->router, method, pattern, forward_marker, svc) != NTC_OK) { cctrl_reply(g, cc, "ERR route register failed\n"); return; }
-        cctrl_reply(g, cc, "OK route added\n");
+        if (!svc) { snprintf(out, cap, "ERR service not loaded\n"); return; }
+        if (ntc_router_add(g->router, method, pattern, forward_marker, svc) != NTC_OK) { snprintf(out, cap, "ERR route register failed\n"); return; }
+        snprintf(out, cap, "OK route added\n");
     } else if (strcmp(cmd, "service-rm") == 0) {
         char *name = strtok_r(NULL, " ", &save);
-        if (!name) { cctrl_reply(g, cc, "ERR usage: service-rm <name>\n"); return; }
+        if (!name) { snprintf(out, cap, "ERR usage: service-rm <name>\n"); return; }
         ntc_err e = ntc_registry_remove_service(g->reg, name);
         service *svc = find_service(g, name);
         if (svc) {
@@ -874,32 +948,60 @@ static void process_control(gateway *g, cctrl *cc) {
                 (void)ntc_poller_del(g->p, ct->fd); kill(ct->pid, SIGTERM); close(ct->fd);
                 waitpid(ct->pid, NULL, WNOHANG); free(ct->rbuf); free(ct->wbuf); free(ct); }
         }
-        cctrl_reply(g, cc, e == NTC_OK ? "OK service removed\n" : "ERR not found\n");
+        snprintf(out, cap, "%s", e == NTC_OK ? "OK service removed\n" : "ERR not found\n");
     } else if (strcmp(cmd, "service-list") == 0) {
         ntc_service_row rows[64]; size_t n = 0;
         (void)ntc_registry_list_services(g->reg, rows, 64, &n);
-        size_t off = (size_t)snprintf(out, sizeof out, "OK [");
-        for (size_t i = 0; i < n && off < sizeof out - 128; i++)
-            off += (size_t)snprintf(out + off, sizeof out - off, "%s{\"name\":\"%s\",\"bin\":\"%s\"}",
+        size_t off = (size_t)snprintf(out, cap, "OK [");
+        for (size_t i = 0; i < n && off < cap - 128; i++)
+            off += (size_t)snprintf(out + off, cap - off, "%s{\"name\":\"%s\",\"bin\":\"%s\"}",
                                     i ? "," : "", rows[i].name, rows[i].bin);
-        snprintf(out + off, sizeof out - off, "]\n");
-        cctrl_reply(g, cc, out);
+        snprintf(out + off, cap - off, "]\n");
     } else if (strcmp(cmd, "route-list") == 0) {
         ntc_route_row rows[128]; size_t n = 0;
         (void)ntc_registry_list_routes(g->reg, rows, 128, &n);
-        size_t off = (size_t)snprintf(out, sizeof out, "OK [");
-        for (size_t i = 0; i < n && off < sizeof out - 160; i++)
-            off += (size_t)snprintf(out + off, sizeof out - off,
+        size_t off = (size_t)snprintf(out, cap, "OK [");
+        for (size_t i = 0; i < n && off < cap - 160; i++)
+            off += (size_t)snprintf(out + off, cap - off,
                                     "%s{\"method\":\"%s\",\"pattern\":\"%s\",\"service\":\"%s\"}",
                                     i ? "," : "", rows[i].method, rows[i].pattern, rows[i].service);
-        snprintf(out + off, sizeof out - off, "]\n");
-        cctrl_reply(g, cc, out);
+        snprintf(out + off, cap - off, "]\n");
+    } else if (strcmp(cmd, "config-set") == 0) {
+        char *key = strtok_r(NULL, " ", &save);
+        char *val = save;
+        while (val && *val == ' ') val++;
+        if (!key || !val || !*val) { snprintf(out, cap, "ERR usage: config-set <key> <value>\n"); return; }
+        if (ntc_registry_set_config(g->reg, key, val) != NTC_OK) { snprintf(out, cap, "ERR write failed\n"); return; }
+        if (strcmp(key, "app.name") == 0) snprintf(g->app_name, sizeof g->app_name, "%s", val);
+        snprintf(out, cap, "OK config set\n");
+    } else if (strcmp(cmd, "config-get") == 0) {
+        char *key = strtok_r(NULL, " ", &save);
+        if (!key) { snprintf(out, cap, "ERR usage: config-get <key>\n"); return; }
+        char val[512]; bool found = false;
+        (void)ntc_registry_get_config(g->reg, key, val, sizeof val, &found);
+        if (found) snprintf(out, cap, "OK %s\n", val); else snprintf(out, cap, "ERR not found\n");
     } else if (strcmp(cmd, "stop") == 0) {
         g_stop = 1;
-        cctrl_reply(g, cc, "OK stopping\n");
+        snprintf(out, cap, "OK stopping\n");
     } else {
-        cctrl_reply(g, cc, "ERR unknown command\n");
+        snprintf(out, cap, "ERR unknown command\n");
     }
+}
+
+static void process_control(gateway *g, cctrl *cc) {
+    char *nl = memchr(cc->buf, '\n', cc->len);
+    if (nl) *nl = '\0';
+    else cc->buf[cc->len < sizeof cc->buf ? cc->len : sizeof cc->buf - 1] = '\0';
+
+    char *sp = strchr(cc->buf, ' ');
+    char *token = cc->buf;
+    char *rest = "";
+    if (sp) { *sp = '\0'; rest = sp + 1; }
+    if (strcmp(token, g->token) != 0) { cctrl_reply(g, cc, "ERR unauthorized\n"); return; }
+
+    char out[8192];
+    exec_control_command(g, rest, out, sizeof out);
+    cctrl_reply(g, cc, out);
 }
 
 static void on_control_readable(gateway *g, cctrl *cc) {
@@ -957,6 +1059,15 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     g.services = calloc(NTC_MAX_SERVICES, sizeof(service));
     if (!g.services) { ntc_registry_close(g.reg); ntc_router_destroy(g.router); return NTC_ERR_OOM; }
     load_token(&g);
+    {
+        char an[128]; bool found = false;
+        if (ntc_registry_get_config(g.reg, "app.name", an, sizeof an, &found) == NTC_OK && found)
+            snprintf(g.app_name, sizeof g.app_name, "%s", an);
+        else {
+            const char *e = getenv("NTC_APP_NAME");
+            snprintf(g.app_name, sizeof g.app_name, "%s", e ? e : "naitron-c app");
+        }
+    }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
