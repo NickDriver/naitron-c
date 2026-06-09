@@ -16,9 +16,10 @@ typedef struct ntc_mw_config {
     char cors_origin[128];  /* "" off, "*" any, or an explicit origin */
     int rate_per_sec;       /* 0 = off                                */
     int rate_burst;
-    char auth_mode[16];     /* "none" | "apikey" | "jwt" (HS256)      */
+    char auth_mode[16];     /* "none" | "apikey" | "jwt"              */
     char auth_secret[256];  /* API key, or the HS256 secret           */
     char auth_protect[128]; /* path prefix to protect ("" = all)      */
+    char auth_jwks_file[256];/* JWKS/JWK file for RS256 (mode "jwt")  */
 } ntc_mw_config;
 
 typedef struct ntc_mw ntc_mw;

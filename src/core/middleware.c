@@ -15,13 +15,37 @@
 
 struct ntc_mw {
     ntc_mw_config cfg;
+    ntc_rsa_pubkey rsa_key;             /* parsed JWKS for RS256 (if configured) */
     ntc_bucket buckets[NTC_RL_BUCKETS]; /* keyed by hash(client_ip) */
 };
+
+/* Read up to `cap`-1 bytes of a file into buf (NUL-terminated). Returns the
+ * length, or -1 on error. Used for the (small) JWKS document. */
+static long slurp_file(const char *path, char *buf, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, cap - 1, f);
+    int err = ferror(f);
+    bool more = !feof(f); /* file bigger than our buffer */
+    fclose(f);
+    if (err || more) return -1;
+    buf[n] = '\0';
+    return (long)n;
+}
 
 ntc_mw *ntc_mw_new(const ntc_mw_config *cfg) {
     ntc_mw *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     m->cfg = *cfg;
+    if (m->cfg.auth_jwks_file[0]) {
+        char doc[16384];
+        long n = slurp_file(m->cfg.auth_jwks_file, doc, sizeof doc);
+        if (n > 0 && ntc_jwk_parse(doc, (size_t)n, &m->rsa_key))
+            NTC_INFO("auth: loaded RS256 key from %s", m->cfg.auth_jwks_file);
+        else
+            NTC_WARN("auth: could not load JWKS '%s'; RS256 tokens will be rejected",
+                     m->cfg.auth_jwks_file);
+    }
     return m;
 }
 void ntc_mw_free(ntc_mw *m) { free(m); }
@@ -96,8 +120,16 @@ bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
                     ok = tok.len == sl && ntc_ct_eq((const uint8_t *)tok.ptr,
                                                     (const uint8_t *)m->cfg.auth_secret, sl);
                 } else if (strcmp(m->cfg.auth_mode, "jwt") == 0) {
+                    /* dispatch on the token's own alg: HS256 -> shared secret,
+                     * RS256 -> the configured JWKS public key. */
                     ntc_jwt_claims cl;
-                    ok = ntc_jwt_verify_hs256(tok.ptr, tok.len, m->cfg.auth_secret, time(NULL), &cl);
+                    char alg[16];
+                    if (ntc_jwt_peek_alg(tok.ptr, tok.len, alg, sizeof alg)) {
+                        if (strcmp(alg, "RS256") == 0 && m->rsa_key.present)
+                            ok = ntc_jwt_verify_rs256(tok.ptr, tok.len, &m->rsa_key, time(NULL), &cl);
+                        else if (strcmp(alg, "HS256") == 0 && m->cfg.auth_secret[0])
+                            ok = ntc_jwt_verify_hs256(tok.ptr, tok.len, m->cfg.auth_secret, time(NULL), &cl);
+                    }
                     if (ok) {
                         snprintf(r->auth_sub, sizeof r->auth_sub, "%s", cl.sub);
                         snprintf(r->auth_scope, sizeof r->auth_scope, "%s", cl.scope);

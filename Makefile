@@ -22,6 +22,12 @@ COV_FLAGS  := -O0 -g -DUNIT_TEST -fprofile-instr-generate -fcoverage-mapping
 # core + registry link against SQLite (the control-plane DB)
 LDLIBS := -lsqlite3
 
+# BearSSL (vendored submodule) supplies RS256 verification + TLS. Only the
+# core/test/coverage binaries need it - NOT the controller or language SDKs.
+BEARSSL_DIR := third_party/bearssl
+BEARSSL_INC := -I$(BEARSSL_DIR)/inc
+BEARSSL_LIB := $(BEARSSL_DIR)/build/libbearssl.a
+
 # libcommon + core gateway (everything in src/core except the CLI main)
 SRC_LIB   := $(wildcard src/common/*.c) \
              $(filter-out src/core/main.c, $(wildcard src/core/*.c))
@@ -48,9 +54,13 @@ all: $(BIN) $(HELLO_BIN)
 
 controllers: $(HELLO_BIN)
 
-$(BIN): $(SRC_LIB) $(SRC_MAIN) | $(BUILD)
-	$(CC) $(COMMON) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) $(LDLIBS) -o $@
+$(BIN): $(SRC_LIB) $(SRC_MAIN) $(BEARSSL_LIB) | $(BUILD)
+	$(CC) $(COMMON) $(BEARSSL_INC) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) $(BEARSSL_LIB) $(LDLIBS) -o $@
 	@echo "built $@"
+
+# BearSSL static lib (submodule-internal build artifact, not tracked here).
+$(BEARSSL_LIB):
+	$(MAKE) -C $(BEARSSL_DIR) lib
 
 $(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
 	$(CC) $(COMMON) $(REL_FLAGS) controllers/hello_controller.c $(SDK_SRC) -o $@
@@ -58,8 +68,8 @@ $(HELLO_BIN): controllers/hello_controller.c $(SDK_SRC) | $(BUILD)
 
 # All objects are linked directly (no static archive) so the TEST()
 # constructors are never dropped by the linker.
-$(TESTBIN): $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) | $(BUILD)
-	$(CC) $(COMMON) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(LDLIBS) -o $@
+$(TESTBIN): $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(BEARSSL_LIB) | $(BUILD)
+	$(CC) $(COMMON) $(BEARSSL_INC) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(BEARSSL_LIB) $(LDLIBS) -o $@
 
 # integration tests spawn the release binaries, so build them first
 test: $(TESTBIN) $(BIN) $(HELLO_BIN)
@@ -74,8 +84,8 @@ test-it: $(TESTBIN) $(BIN) $(HELLO_BIN)
 test-list: $(TESTBIN)
 	./$(TESTBIN) list
 
-coverage: | $(BUILD)
-	$(CC) $(COMMON) $(COV_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(LDLIBS) -o $(COVBIN)
+coverage: $(BEARSSL_LIB) | $(BUILD)
+	$(CC) $(COMMON) $(BEARSSL_INC) $(COV_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(BEARSSL_LIB) $(LDLIBS) -o $(COVBIN)
 	LLVM_PROFILE_FILE=$(BUILD)/ntc.profraw ./$(COVBIN) >/dev/null 2>&1 || true
 	xcrun llvm-profdata merge -sparse $(BUILD)/ntc.profraw -o $(BUILD)/ntc.profdata
 	xcrun llvm-cov report ./$(COVBIN) -instr-profile=$(BUILD)/ntc.profdata $(SRC_LIB)
