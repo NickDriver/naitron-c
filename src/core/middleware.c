@@ -1,11 +1,14 @@
 #define _GNU_SOURCE
 #include "ntc/middleware.h"
+#include "ntc/crypto.h"
+#include "ntc/jwt.h"
 #include "ntc/log.h"
 
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NTC_RL_BUCKETS 1024
@@ -77,6 +80,33 @@ bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
             r->content_type = NTC_SLICE_LIT("text/plain");
             r->body = NTC_SLICE_LIT("");
             return true;
+        }
+    }
+
+    if (m->cfg.auth_mode[0] && strcmp(m->cfg.auth_mode, "none") != 0) {
+        bool protectd = m->cfg.auth_protect[0] == '\0' ||
+                        ntc_slice_starts_with(req->path, ntc_slice_cstr(m->cfg.auth_protect));
+        if (protectd) {
+            ntc_slice a = ntc_http_header(req, "authorization");
+            bool ok = false;
+            if (a.len > 7 && memcmp(a.ptr, "Bearer ", 7) == 0) {
+                ntc_slice tok = ntc_slice_new(a.ptr + 7, a.len - 7);
+                if (strcmp(m->cfg.auth_mode, "apikey") == 0) {
+                    size_t sl = strlen(m->cfg.auth_secret);
+                    ok = tok.len == sl && ntc_ct_eq((const uint8_t *)tok.ptr,
+                                                    (const uint8_t *)m->cfg.auth_secret, sl);
+                } else if (strcmp(m->cfg.auth_mode, "jwt") == 0) {
+                    ntc_jwt_claims cl;
+                    ok = ntc_jwt_verify_hs256(tok.ptr, tok.len, m->cfg.auth_secret, time(NULL), &cl);
+                }
+            }
+            if (!ok) {
+                r->short_circuit = true;
+                r->status = 401;
+                r->content_type = NTC_SLICE_LIT("application/json");
+                r->body = NTC_SLICE_LIT("{\"error\":\"unauthorized\"}");
+                return true;
+            }
         }
     }
 

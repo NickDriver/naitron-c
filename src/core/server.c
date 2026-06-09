@@ -1121,11 +1121,20 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
             mcfg.rate_burst = atoi(v);
         if (ntc_registry_get_config(g.reg, "accesslog", v, sizeof v, &f) == NTC_OK && f)
             mcfg.access_log = atoi(v) != 0;
+        if (ntc_registry_get_config(g.reg, "auth.mode", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.auth_mode, sizeof mcfg.auth_mode, "%s", v);
+        if (ntc_registry_get_config(g.reg, "auth.secret", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.auth_secret, sizeof mcfg.auth_secret, "%s", v);
+        if (ntc_registry_get_config(g.reg, "auth.protect", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.auth_protect, sizeof mcfg.auth_protect, "%s", v);
         /* env overrides (handy for ops/tests) */
         const char *e;
         if ((e = getenv("NTC_CORS_ORIGIN"))) snprintf(mcfg.cors_origin, sizeof mcfg.cors_origin, "%s", e);
         if ((e = getenv("NTC_RATELIMIT_PER_SEC"))) mcfg.rate_per_sec = atoi(e);
         if ((e = getenv("NTC_RATELIMIT_BURST"))) mcfg.rate_burst = atoi(e);
+        if ((e = getenv("NTC_AUTH_MODE"))) snprintf(mcfg.auth_mode, sizeof mcfg.auth_mode, "%s", e);
+        if ((e = getenv("NTC_AUTH_SECRET"))) snprintf(mcfg.auth_secret, sizeof mcfg.auth_secret, "%s", e);
+        if ((e = getenv("NTC_AUTH_PROTECT"))) snprintf(mcfg.auth_protect, sizeof mcfg.auth_protect, "%s", e);
         g.mw = ntc_mw_new(&mcfg);
     }
 

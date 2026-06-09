@@ -5,4 +5,5 @@ are deferred. Nothing here blocks moving to the next step.
 
 | # | Stage | Item | Status |
 |---|-------|------|--------|
-| _none yet_ | | | |
+| 1 | M3 | **BearSSL vendoring.** RS256/ES256 JWT (needs RSA/EC verify + JWKS over HTTPS) and OAuth2 login flows (need TLS) require a vetted crypto/TLS lib. Vendoring BearSSL (~150 files) isn't doable from this session. **Implemented without it:** API-key auth + **HS256** JWT validation (SHA-256 + HMAC + base64url written from scratch and verified against RFC test vectors — deterministic hashes, not key-material crypto). **Deferred until BearSSL is vendored:** RS256/ES256 + JWKS, OAuth2 authorization-code login. Decision needed: how to vendor BearSSL (git submodule / vendor script / amalgamation). | OPEN |
+| 2 | M3 | Identity (JWT `sub`/scope) is currently only used to gate + log at the gateway. Passing it through to controllers needs the wire-protocol extension in **M4**. | tracked → M4 |

@@ -11,11 +11,14 @@
 #include "ntc/slice.h"
 
 typedef struct ntc_mw_config {
-    bool request_id;        /* add an X-Request-Id header           */
-    bool access_log;        /* log method/path/status/duration      */
+    bool request_id;        /* add an X-Request-Id header             */
+    bool access_log;        /* log method/path/status/duration        */
     char cors_origin[128];  /* "" off, "*" any, or an explicit origin */
-    int rate_per_sec;       /* 0 = off                              */
+    int rate_per_sec;       /* 0 = off                                */
     int rate_burst;
+    char auth_mode[16];     /* "none" | "apikey" | "jwt" (HS256)      */
+    char auth_secret[256];  /* API key, or the HS256 secret           */
+    char auth_protect[128]; /* path prefix to protect ("" = all)      */
 } ntc_mw_config;
 
 typedef struct ntc_mw ntc_mw;
