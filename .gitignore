@@ -8,3 +8,7 @@ build/
 *.db
 *.db-journal
 *.db-wal
+
+# Rust SDK build artifacts
+sdk/rust/target/
+sdk/rust/Cargo.lock

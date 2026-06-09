@@ -88,3 +88,9 @@ $(BUILD):
 
 clean:
 	rm -rf $(BUILD)
+
+# build the Go + Rust example controllers (Python/TS run as scripts)
+.PHONY: sdk-examples
+sdk-examples:
+	cd sdk/go && go build -o ../../build/go_controller ./example
+	cd sdk/rust && cargo build --example hello
