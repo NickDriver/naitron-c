@@ -290,4 +290,58 @@ TEST(jwt, rs256_rejects_hs256_token) {
     ntc_jwt_claims c;
     ASSERT_FALSE(ntc_jwt_verify_rs256(hs, strlen(hs), &k, 0, &c));
 }
+
+TEST(jwt, rs256_rejects_expired) {
+    /* the vector's exp is 4102444800 (year 2100); a `now` past it must reject,
+     * but the signature itself is valid - so this isolates the exp check. */
+    ntc_rsa_pubkey k;
+    ASSERT_TRUE(ntc_jwk_parse(RS256_JWKS, strlen(RS256_JWKS), &k));
+    ntc_jwt_claims c;
+    ASSERT_TRUE(ntc_jwt_verify_rs256(RS256_TOKEN, strlen(RS256_TOKEN), &k, 4102444799, &c));
+    ASSERT_FALSE(ntc_jwt_verify_rs256(RS256_TOKEN, strlen(RS256_TOKEN), &k, 4102444801, &c));
+}
+
+/* Same 2048-bit key family, a token carrying NO exp claim. */
+static const char *RS256_NOEXP_JWKS =
+    "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k2\",\"alg\":\"RS256\","
+    "\"n\":\"r3ticbYx7odSGvet5WsRULP9Bxv_R_HPb0T42VyhymP2dLyhVpA5WfzrmEh_E1469enjA1RNz7qK"
+    "cY7ixP4zpgrjH1-ZpyEp9sC7kAhBIFwk_r3wEn4DSXh-xbhgf4vhjV0QLX1vaS6pIw8wzyiXMuydo_P0wcT3"
+    "vW_whM_3R7BjnGlwu2SJjBnMc2CGfESWJcy6EVNXMxyUGEls1ePZrotLqWsanppH2Ok2BmeXiHpl0OwqbM3g"
+    "QlMTNS4ro9_3PFk688M4tfI_iFP8IHulG1tDlbjMylcI_LEYeQZKsFl90hJZWyecVVieFycIyNSn55DlXYaW"
+    "c_YVcmjxshoGrw\",\"e\":\"AQAB\"}]}";
+static const char *RS256_NOEXP_TOKEN =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJub2V4cC11c2VyIiwic2NvcGUiOiJ4In0."
+    "D_J7jzZQljdwNN7OK4VaxtwIsmpC9R1RnMBdAi_RMGZ1y2FKiH_Lx4fH53444RSjP4NU-M3-rqbGdmcnJGKd"
+    "Zy7bxZeWtkHsYOv7Pa2sxVKHSK91vNkoWl80MB5pYVtK2eUBsk74ed_NufohfwBFfmkI4e2q1hnVeVZZRkHp"
+    "5P-HJOlUgBxdtHX34d3b5J1HtdWree5gitZWAjEwJpdibpFKjjbOrJ4uuXUKTNXAqVY6mBIaQxlo_kr9a7Zk"
+    "CXRpJo4zCm6NfdBYImydx9W0a5RlCzhE6i2yQ4fWrN_wDWDWAnTXKflEfSDzX0BGNOALQmPJDEqeIPE7hhqs"
+    "MRr_4w";
+
+TEST(jwt, rs256_accepts_missing_exp) {
+    /* a token with no exp must verify regardless of `now` (no expiry to enforce) */
+    ntc_rsa_pubkey k;
+    ASSERT_TRUE(ntc_jwk_parse(RS256_NOEXP_JWKS, strlen(RS256_NOEXP_JWKS), &k));
+    ntc_jwt_claims c;
+    ASSERT_TRUE(ntc_jwt_verify_rs256(RS256_NOEXP_TOKEN, strlen(RS256_NOEXP_TOKEN), &k, 4102444801, &c));
+    ASSERT_TRUE(ntc_slice_eq_cstr(ntc_slice_cstr(c.sub), "noexp-user"));
+}
+
+TEST(jwt, jwk_skips_non_rsa_keys) {
+    /* a JWK Set whose first entry is an EC key: we must skip it and use the RSA one */
+    char doc[1200];
+    snprintf(doc, sizeof doc,
+        "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AAAA\",\"y\":\"BBBB\"},"
+        "{\"kty\":\"RSA\",\"kid\":\"k2\",\"alg\":\"RS256\",\"n\":\"%s\",\"e\":\"AQAB\"}]}",
+        "r3ticbYx7odSGvet5WsRULP9Bxv_R_HPb0T42VyhymP2dLyhVpA5WfzrmEh_E1469enjA1RNz7qK"
+        "cY7ixP4zpgrjH1-ZpyEp9sC7kAhBIFwk_r3wEn4DSXh-xbhgf4vhjV0QLX1vaS6pIw8wzyiXMuydo_P0wcT3"
+        "vW_whM_3R7BjnGlwu2SJjBnMc2CGfESWJcy6EVNXMxyUGEls1ePZrotLqWsanppH2Ok2BmeXiHpl0OwqbM3g"
+        "QlMTNS4ro9_3PFk688M4tfI_iFP8IHulG1tDlbjMylcI_LEYeQZKsFl90hJZWyecVVieFycIyNSn55DlXYaW"
+        "c_YVcmjxshoGrw");
+    ntc_rsa_pubkey k;
+    ASSERT_TRUE(ntc_jwk_parse(doc, strlen(doc), &k));
+    ASSERT_TRUE(k.present);
+    ASSERT_EQ_INT(256, (int)k.nlen);
+    ntc_jwt_claims c;
+    ASSERT_TRUE(ntc_jwt_verify_rs256(RS256_NOEXP_TOKEN, strlen(RS256_NOEXP_TOKEN), &k, 0, &c));
+}
 #endif /* UNIT_TEST */
