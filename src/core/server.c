@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -46,13 +47,6 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-static const char *find_eoh(const char *b, size_t n) {
-    for (size_t i = 0; i + 4 <= n; i++)
-        if (b[i] == '\r' && b[i + 1] == '\n' && b[i + 2] == '\r' && b[i + 3] == '\n')
-            return b + i;
-    return NULL;
-}
-
 static conn *conn_new(int fd) {
     conn *c = calloc(1, sizeof *c);
     if (!c) return NULL;
@@ -69,19 +63,33 @@ static void conn_close(ntc_poller *p, conn *c) {
     free(c);
 }
 
-static int conn_build_response(conn *c) {
-    ntc_slice body = NTC_SLICE_LIT(
-        "{\"service\":\"naitron-c\",\"status\":\"ok\","
-        "\"message\":\"P1 event loop\"}");
+static int conn_respond(conn *c, int status, const char *text,
+                        ntc_slice ctype, ntc_slice body) {
     ntc_slice resp;
-    if (ntc_http_format_response(&c->arena, 200, "OK",
-            NTC_SLICE_LIT("application/json"), body, &resp) != NTC_OK)
+    if (ntc_http_format_response(&c->arena, status, text, ctype, body, &resp) != NTC_OK)
         return -1;
     c->wbuf = resp.ptr;
     c->wlen = resp.len;
     c->wsent = 0;
     c->state = CS_WRITE;
     return 0;
+}
+
+/* P2: echo the parsed request so the parser is observable end-to-end.
+ * (Real routing to controllers arrives in P3.) */
+static int conn_respond_echo(conn *c, const ntc_request *req) {
+    char body[1024];
+    int m = snprintf(body, sizeof body,
+        "{\"service\":\"naitron-c\",\"method\":\"%.*s\",\"path\":\"%.*s\","
+        "\"query\":\"%.*s\",\"headers\":%zu,\"content_length\":%zu}",
+        (int)req->method.len, req->method.ptr,
+        (int)req->path.len, req->path.ptr,
+        (int)req->query.len, req->query.ptr,
+        req->nheaders, req->content_length);
+    if (m < 0) m = 0;
+    if ((size_t)m >= sizeof body) m = (int)sizeof body - 1;
+    return conn_respond(c, 200, "OK", NTC_SLICE_LIT("application/json"),
+                        ntc_slice_new(body, (size_t)m));
 }
 
 /* returns 0 if the connection is still alive, -1 if it was closed/freed */
@@ -99,25 +107,51 @@ static int on_writable(ntc_poller *p, conn *c) {
 }
 
 static int on_readable(ntc_poller *p, conn *c) {
-    for (;;) {
-        if (c->rlen >= sizeof c->rbuf) break; /* headers too big: just answer */
+    bool eof = false;
+    for (;;) {                                      /* drain the socket */
+        if (c->rlen >= sizeof c->rbuf) break;
         ssize_t n = recv(c->fd, c->rbuf + c->rlen, sizeof c->rbuf - c->rlen, 0);
-        if (n > 0) {
-            c->rlen += (size_t)n;
-            if (find_eoh(c->rbuf, c->rlen)) break; /* end of headers */
-            continue;
-        }
-        if (n == 0) {                       /* peer closed */
-            if (c->rlen == 0) { conn_close(p, c); return -1; }
-            break;
-        }
+        if (n > 0) { c->rlen += (size_t)n; continue; }
+        if (n == 0) { eof = true; break; }
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* wait for more */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
         conn_close(p, c);
         return -1;
     }
 
-    if (conn_build_response(c) != 0) { conn_close(p, c); return -1; }
+    ntc_request req;
+    size_t consumed = 0;
+    ntc_parse_result pr = ntc_http_parse_request(c->rbuf, c->rlen, &req, &consumed);
+    int built;
+
+    if (pr == NTC_PARSE_INCOMPLETE) {
+        if (eof) { conn_close(p, c); return -1; }       /* client gave up */
+        if (c->rlen < sizeof c->rbuf) return 0;         /* wait for more */
+        built = conn_respond(c, 431, "Request Header Fields Too Large",
+                             NTC_SLICE_LIT("text/plain"),
+                             NTC_SLICE_LIT("431 headers too large\n"));
+    } else if (pr == NTC_PARSE_ERROR) {
+        built = conn_respond(c, 400, "Bad Request", NTC_SLICE_LIT("text/plain"),
+                             NTC_SLICE_LIT("400 bad request\n"));
+    } else {
+        /* OK: wait until the whole body is buffered before answering */
+        size_t need = consumed;
+        if (req.has_content_length &&
+            ntc_size_add(consumed, req.content_length, &need) != NTC_OK) {
+            built = conn_respond(c, 400, "Bad Request", NTC_SLICE_LIT("text/plain"),
+                                 NTC_SLICE_LIT("400 bad length\n"));
+        } else if (req.has_content_length && need > c->rlen) {
+            if (eof) { conn_close(p, c); return -1; }
+            if (c->rlen < sizeof c->rbuf) return 0;     /* wait for body */
+            built = conn_respond(c, 413, "Payload Too Large",
+                                 NTC_SLICE_LIT("text/plain"),
+                                 NTC_SLICE_LIT("413 body too large\n"));
+        } else {
+            built = conn_respond_echo(c, &req);
+        }
+    }
+
+    if (built != 0) { conn_close(p, c); return -1; }
     if (ntc_poller_mod(p, c->fd, NTC_POLL_WRITE, c) != NTC_OK) {
         conn_close(p, c);
         return -1;

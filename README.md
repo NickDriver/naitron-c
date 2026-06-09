@@ -5,10 +5,11 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P1** — non-blocking event loop. The gateway runs on a `poller`
-> abstraction (kqueue on macOS/BSD, epoll on Linux) and serves many concurrent
-> connections with a per-connection state machine. Foundations (test harness,
-> error handling, arena allocator, string slices, signal/crash nets) are in place.
+> Status: **P2** — HTTP/1.1 request parser. The event-loop gateway now parses
+> method, target/path/query, headers, and Content-Length (with smuggling guards),
+> rejects malformed input with 400/431/413, and waits for full bodies. Runs on a
+> `poller` abstraction (kqueue on macOS/BSD, epoll on Linux). Foundations (tests,
+> error handling, arenas, slices, signal/crash nets) are in place.
 
 ## Build & run
 
