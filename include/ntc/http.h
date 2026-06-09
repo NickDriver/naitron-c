@@ -45,6 +45,9 @@ ntc_parse_result ntc_http_parse_request(const char *buf, size_t len,
 /* Case-insensitive header lookup; returns the value slice or an empty slice. */
 ntc_slice ntc_http_header(const ntc_request *req, const char *name);
 
+/* Standard reason phrase for a status code (e.g. 404 -> "Not Found"). */
+const char *ntc_http_status_text(int status);
+
 /* Format a complete HTTP/1.1 response into `a` (Connection: close). */
 NTC_NODISCARD ntc_err ntc_http_format_response(ntc_arena *a, int status,
         const char *status_text, ntc_slice content_type, ntc_slice body,
