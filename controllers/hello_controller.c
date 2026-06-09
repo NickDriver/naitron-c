@@ -10,20 +10,16 @@
 
 static int handle(const ntc_request *req, ntc_response *res, ntc_arena *a, void *u) {
     (void)u;
-    size_t cap = req->method.len + req->path.len + 160;
-    char *body = ntc_arena_alloc(a, cap);
-    if (!body) return -1;
-    int m = snprintf(body, cap,
-        "{\"controller\":\"hello\",\"pid\":%ld,\"method\":\"%.*s\",\"path\":\"%.*s\"}",
+    ntc_slice name = ntc_req_param(req, "name");   /* path param :name  */
+    ntc_slice sub = req->auth_sub;                 /* auth subject      */
+    return ntc_reply_json(res, a, 200,
+        "{\"controller\":\"hello\",\"pid\":%ld,\"method\":\"%.*s\",\"path\":\"%.*s\","
+        "\"name\":\"%.*s\",\"sub\":\"%.*s\"}",
         (long)getpid(),
         (int)req->method.len, req->method.ptr,
-        (int)req->path.len, req->path.ptr);
-    if (m < 0) return -1;
-    if ((size_t)m >= cap) m = (int)cap - 1;
-    res->status = 200;
-    res->content_type = NTC_SLICE_LIT("application/json");
-    res->body = ntc_slice_new(body, (size_t)m);
-    return 0;
+        (int)req->path.len, req->path.ptr,
+        (int)name.len, name.ptr,
+        (int)sub.len, sub.ptr);
 }
 
 int main(void) {

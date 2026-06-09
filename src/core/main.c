@@ -15,6 +15,7 @@
 #include "ntc/slice.h"
 #include "ntc/version.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -224,6 +225,41 @@ static int cmd_logs(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_new_controller(const char *prog, const char *name) {
+    for (const char *p = name; *p; p++)
+        if (!(isalnum((unsigned char)*p) || *p == '_')) { cli_errorf("invalid name '%s' (use a-z0-9_)", name); return 1; }
+    char path[256];
+    snprintf(path, sizeof path, "controllers/%s_controller.c", name);
+    if (access(path, F_OK) == 0) { cli_errorf("%s already exists", path); return 1; }
+    FILE *f = fopen(path, "w");
+    if (!f) { cli_errorf("cannot write %s: %s", path, strerror(errno)); return 1; }
+    fprintf(f,
+        "#define _GNU_SOURCE\n"
+        "#include \"ntc/controller.h\"\n\n"
+        "#include <unistd.h>\n\n"
+        "static int handle(const ntc_request *req, ntc_response *res, ntc_arena *a, void *u) {\n"
+        "    (void)u;\n"
+        "    /* helpers: ntc_req_param(req,\"id\"), ntc_req_query(req,\"page\"),\n"
+        "     *          ntc_http_header(req,\"...\"), req->body, req->auth_sub */\n"
+        "    return ntc_reply_json(res, a, 200,\n"
+        "        \"{\\\"controller\\\":\\\"%s\\\",\\\"path\\\":\\\"%%.*s\\\"}\",\n"
+        "        (int)req->path.len, req->path.ptr);\n"
+        "}\n\n"
+        "int main(void) {\n"
+        "    ntc_controller ctl = { .name = \"%s\", .handle = handle, .udata = NULL };\n"
+        "    return ntc_controller_run(&ctl);\n"
+        "}\n",
+        name, name);
+    fclose(f);
+    printf("created %s\n\n", path);
+    printf("build:\n  clang -std=c23 -Iinclude %s \\\n", path);
+    printf("    src/common/controller_sdk.c src/common/wire.c src/common/arena.c \\\n");
+    printf("    src/common/slice.c src/common/http_request.c -o build/%s_controller\n\n", name);
+    printf("register (on a running core):\n  %s service add %s ./build/%s_controller\n"
+           "  %s route add GET /api/%s %s\n", prog, name, name, prog, name, name);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     ntc_install_signal_handlers();
     const char *prog = (argc > 0) ? argv[0] : NTC_NAME;
@@ -237,6 +273,10 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "stop") == 0) return cmd_stop();
     if (strcmp(cmd, "logs") == 0) return cmd_logs(argc, argv);
     if (strcmp(cmd, "status") == 0) return cmd_status(argc, argv);
+    if (strcmp(cmd, "new") == 0) {
+        if (argc < 4 || strcmp(argv[2], "controller") != 0) { cli_errorf("usage: %s new controller <name>", prog); return 2; }
+        return cmd_new_controller(prog, argv[3]);
+    }
 
     if (strcmp(cmd, "restart") == 0) {
         if (argc < 3) { cli_errorf("usage: %s restart <port>", prog); return 2; }

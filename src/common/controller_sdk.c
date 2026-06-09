@@ -3,10 +3,28 @@
 #include "ntc/wire.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+int ntc_reply_json(ntc_response *res, ntc_arena *a, int status, const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (n < 0) { va_end(ap); return -1; }
+    char *buf = ntc_arena_alloc(a, (size_t)n + 1);
+    if (!buf) { va_end(ap); return -1; }
+    vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    res->status = status;
+    res->content_type = NTC_SLICE_LIT("application/json");
+    res->body = ntc_slice_new(buf, (size_t)n);
+    return 0;
+}
 
 #define NTC_CTL_MAX_PAYLOAD (256 * 1024)
 

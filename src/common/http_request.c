@@ -140,6 +140,33 @@ ntc_slice ntc_http_header(const ntc_request *req, const char *name) {
     return ntc_slice_new(NULL, 0);
 }
 
+ntc_slice ntc_req_param(const ntc_request *req, const char *name) {
+    ntc_slice key = ntc_slice_cstr(name);
+    for (size_t i = 0; i < req->nparams; i++)
+        if (ntc_slice_eq(req->params[i].name, key)) return req->params[i].value;
+    return ntc_slice_new(NULL, 0);
+}
+
+ntc_slice ntc_req_query(const ntc_request *req, const char *name) {
+    size_t nlen = strlen(name);
+    const char *p = req->query.ptr;
+    size_t len = req->query.len;
+    size_t i = 0;
+    while (i < len) {
+        size_t start = i;
+        while (i < len && p[i] != '&') i++;
+        /* segment [start, i) is "k=v" or "k" */
+        const char *eq = memchr(p + start, '=', i - start);
+        if (eq) {
+            size_t klen = (size_t)(eq - (p + start));
+            if (klen == nlen && memcmp(p + start, name, nlen) == 0)
+                return ntc_slice_new(eq + 1, (size_t)(p + i - (eq + 1)));
+        }
+        i++; /* skip '&' */
+    }
+    return ntc_slice_new(NULL, 0);
+}
+
 #ifdef UNIT_TEST
 #include "ntc/test.h"
 

@@ -77,6 +77,8 @@ typedef struct conn {
     char extra_headers[512];
     char log_method[16];
     char log_path[200];
+    char auth_sub[128];
+    char auth_scope[256];
     long req_start;
     bool logged;
     ntc_arena arena;
@@ -443,7 +445,19 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     }
     if (rs == NTC_ROUTE_METHOD_NOT_ALLOWED)
         return respond_and_flush(g, c, 405, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
-    if (h == forward_marker) { g->m.forwarded++; return gw_forward(g, c, req, (service *)udata); }
+    if (h == forward_marker) {
+        g->m.forwarded++;
+        /* enrich the forwarded request with path params + auth identity */
+        ntc_request fr = *req;
+        fr.nparams = params.count < NTC_MAX_PARAMS ? params.count : NTC_MAX_PARAMS;
+        for (size_t i = 0; i < fr.nparams; i++) {
+            fr.params[i].name = params.items[i].name;
+            fr.params[i].value = params.items[i].value;
+        }
+        fr.auth_sub = ntc_slice_cstr(c->auth_sub);
+        fr.auth_scope = ntc_slice_cstr(c->auth_scope);
+        return gw_forward(g, c, &fr, (service *)udata);
+    }
 
     g->m.builtin++;
     ntc_response res = { .status = 200, .content_type = JSON, .body = NTC_SLICE_LIT("") };
@@ -642,6 +656,8 @@ static int on_readable(gateway *g, conn *c) {
             bool sc = ntc_mw_before(g->mw, &req, c->client_ip, now_ms(), &r);
             snprintf(c->extra_headers, sizeof c->extra_headers, "%s", r.extra_headers);
             snprintf(c->request_id, sizeof c->request_id, "%s", r.request_id);
+            snprintf(c->auth_sub, sizeof c->auth_sub, "%s", r.auth_sub);
+            snprintf(c->auth_scope, sizeof c->auth_scope, "%s", r.auth_scope);
             if (sc) { rec_status(g, r.status); return send_resp(g, c, r.status, r.content_type, r.body); }
         }
     }

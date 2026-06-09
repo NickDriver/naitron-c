@@ -33,6 +33,8 @@ typedef struct ntc_mw_result {
     ntc_slice body;
     char extra_headers[512]; /* added to whatever response is sent  */
     char request_id[40];
+    char auth_sub[128];      /* authenticated subject (jwt sub), "" if none */
+    char auth_scope[256];
 } ntc_mw_result;
 
 /* Run the before-chain. Returns true if a response should be sent immediately. */

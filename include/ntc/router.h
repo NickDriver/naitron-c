@@ -14,9 +14,7 @@
 #include "ntc/http.h"
 #include "ntc/slice.h"
 
-#define NTC_MAX_PARAMS 8
-
-/* ntc_response lives in http.h (shared with controllers). */
+/* NTC_MAX_PARAMS + ntc_response live in http.h (shared with controllers). */
 
 typedef struct ntc_route_params {
     struct { ntc_slice name, value; } items[NTC_MAX_PARAMS];

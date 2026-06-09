@@ -98,6 +98,10 @@ bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
                 } else if (strcmp(m->cfg.auth_mode, "jwt") == 0) {
                     ntc_jwt_claims cl;
                     ok = ntc_jwt_verify_hs256(tok.ptr, tok.len, m->cfg.auth_secret, time(NULL), &cl);
+                    if (ok) {
+                        snprintf(r->auth_sub, sizeof r->auth_sub, "%s", cl.sub);
+                        snprintf(r->auth_scope, sizeof r->auth_scope, "%s", cl.scope);
+                    }
                 }
             }
             if (!ok) {

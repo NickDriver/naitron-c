@@ -39,8 +39,8 @@ COVBIN  := $(BUILD)/ntc_cov
 
 # Example out-of-process controller (its own binary; links the SDK + wire).
 HELLO_BIN := $(BUILD)/hello_controller
-SDK_SRC   := src/common/controller_sdk.c src/common/wire.c \
-             src/common/arena.c src/common/slice.c
+SDK_SRC   := src/common/controller_sdk.c src/common/wire.c src/common/arena.c \
+             src/common/slice.c src/common/http_request.c
 
 .PHONY: all controllers test test-unit test-it test-list coverage run clean
 

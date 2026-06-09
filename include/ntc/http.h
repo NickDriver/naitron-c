@@ -10,6 +10,7 @@
 #include "ntc/slice.h"
 
 #define NTC_MAX_HEADERS 64
+#define NTC_MAX_PARAMS  8
 
 typedef struct ntc_header {
     ntc_slice name;
@@ -24,6 +25,10 @@ typedef struct ntc_request {
     int minor_version;         /* 0 or 1 for HTTP/1.x        */
     ntc_header headers[NTC_MAX_HEADERS];
     size_t nheaders;
+    ntc_header params[NTC_MAX_PARAMS]; /* captured path params (controller side) */
+    size_t nparams;
+    ntc_slice auth_sub;        /* authenticated subject ("" if none) */
+    ntc_slice auth_scope;
     bool has_content_length;
     size_t content_length;
     ntc_slice body;            /* body bytes present in buf  */
@@ -51,6 +56,10 @@ ntc_parse_result ntc_http_parse_request(const char *buf, size_t len,
 
 /* Case-insensitive header lookup; returns the value slice or an empty slice. */
 ntc_slice ntc_http_header(const ntc_request *req, const char *name);
+
+/* Controller-side accessors. */
+ntc_slice ntc_req_param(const ntc_request *req, const char *name); /* path param */
+ntc_slice ntc_req_query(const ntc_request *req, const char *name); /* ?k=v (raw) */
 
 /* Standard reason phrase for a status code (e.g. 404 -> "Not Found"). */
 const char *ntc_http_status_text(int status);

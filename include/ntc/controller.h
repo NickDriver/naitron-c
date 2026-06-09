@@ -25,4 +25,8 @@ typedef struct ntc_controller {
  * Blocks until the core closes the connection; returns a process exit code. */
 int ntc_controller_run(const ntc_controller *ctl);
 
+/* Build a JSON response into `a` (printf-style). Returns 0, or -1 on OOM. */
+__attribute__((format(printf, 4, 5)))
+int ntc_reply_json(ntc_response *res, ntc_arena *a, int status, const char *fmt, ...);
+
 #endif /* NTC_CONTROLLER_H */

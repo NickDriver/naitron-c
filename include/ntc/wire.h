@@ -15,7 +15,7 @@
 #include "ntc/slice.h"
 
 #define NTC_WIRE_MAGIC      0x4E544331u /* "NTC1" */
-#define NTC_WIRE_VERSION    1
+#define NTC_WIRE_VERSION    2  /* v2: request carries path params + auth identity */
 #define NTC_WIRE_HEADER_LEN 16
 
 typedef enum ntc_msg_type {

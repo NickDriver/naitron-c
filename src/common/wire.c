@@ -99,6 +99,14 @@ ssize_t ntc_wire_encode_request(const ntc_request *req, uint8_t *out, size_t cap
         w_slice16(&w, req->headers[i].name);
         w_slice16(&w, req->headers[i].value);
     }
+    size_t np = req->nparams > NTC_MAX_PARAMS ? NTC_MAX_PARAMS : req->nparams;
+    w_u16(&w, (uint16_t)np);
+    for (size_t i = 0; i < np; i++) {
+        w_slice16(&w, req->params[i].name);
+        w_slice16(&w, req->params[i].value);
+    }
+    w_slice16(&w, req->auth_sub);
+    w_slice16(&w, req->auth_scope);
     w_u32(&w, (uint32_t)req->body.len);
     w_bytes(&w, req->body.ptr, req->body.len);
     return w.err ? -1 : (ssize_t)w.off;
@@ -119,6 +127,15 @@ bool ntc_wire_decode_request(const uint8_t *buf, size_t len, ntc_request *req) {
         req->headers[i].value = r_slice16(&r);
     }
     req->nheaders = nh;
+    uint16_t np = r_u16(&r);
+    if (np > NTC_MAX_PARAMS) return false;
+    for (uint16_t i = 0; i < np; i++) {
+        req->params[i].name = r_slice16(&r);
+        req->params[i].value = r_slice16(&r);
+    }
+    req->nparams = np;
+    req->auth_sub = r_slice16(&r);
+    req->auth_scope = r_slice16(&r);
     req->body = r_slice32(&r);
     req->content_length = req->body.len;
     req->has_content_length = req->body.len > 0;
