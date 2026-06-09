@@ -1,0 +1,7 @@
+build/
+*.o
+*.profraw
+*.profdata
+*.dSYM/
+.vscode/
+.DS_Store
