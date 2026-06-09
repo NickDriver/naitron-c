@@ -19,8 +19,9 @@ REL_FLAGS  := -O2 -DNDEBUG
 TEST_FLAGS := -O1 -g -DUNIT_TEST -fsanitize=address,undefined -fno-omit-frame-pointer
 COV_FLAGS  := -O0 -g -DUNIT_TEST -fprofile-instr-generate -fcoverage-mapping
 
-# libcommon + core gateway (everything except the CLI main)
-SRC_LIB   := $(wildcard src/common/*.c) src/core/server.c
+# libcommon + core gateway (everything in src/core except the CLI main)
+SRC_LIB   := $(wildcard src/common/*.c) \
+             $(filter-out src/core/main.c, $(wildcard src/core/*.c))
 SRC_MAIN  := src/core/main.c
 SRC_TEST  := src/test/test_main.c
 TESTS_INT := $(wildcard tests/*.c)   # integration tests (test build only)

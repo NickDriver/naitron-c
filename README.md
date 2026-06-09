@@ -5,9 +5,10 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P0** — walking skeleton. The gateway listens and answers a fixed
-> `200 OK`. Foundations (test harness, error handling, arena allocator,
-> string slices, signal/crash nets) are in place.
+> Status: **P1** — non-blocking event loop. The gateway runs on a `poller`
+> abstraction (kqueue on macOS/BSD, epoll on Linux) and serves many concurrent
+> connections with a per-connection state machine. Foundations (test harness,
+> error handling, arena allocator, string slices, signal/crash nets) are in place.
 
 ## Build & run
 
