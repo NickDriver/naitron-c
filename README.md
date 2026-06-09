@@ -5,11 +5,13 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **P7** — built-in MCP server. `ntc mcp` is a JSON-RPC stdio MCP server
-> exposing the control plane as tools (`naitron_add_service`, `naitron_add_route`,
-> `naitron_status`, …), so an AI client (e.g. Claude) can inspect and manage a
-> live server. Includes a small arena-based JSON parser. Built on the control
-> plane (P6), orchestrator (P5), IPC (P4), router (P3), parser (P2), loop (P1).
+> Status: **P8 — feature-complete (P1–P8).** A read-only dashboard + metrics
+> serve on a localhost-only admin port (`ntc start 3000 --admin 9000`, then open
+> http://127.0.0.1:9000): live request/status counts, per-service up/down status
+> and restarts, and routes. The full stack: event loop (P1), HTTP parser (P2),
+> router (P3), IPC + Controller SDK (P4), orchestrator with supervision + SQLite
+> registry (P5), authenticated control plane + CLI (P6), built-in MCP server (P7),
+> dashboard (P8).
 
 ## CLI
 
@@ -20,6 +22,8 @@ ntc service add hello ./build/hello_controller   # register + spawn (live)
 ntc route add GET /api/hello hello          # route to a service (live)
 ntc service list ; ntc route list
 ntc service rm hello ; ntc stop ; ntc token
+ntc start 3000 --admin 9000                 # + read-only dashboard on :9000
+ntc mcp                                      # built-in MCP server (stdio) for AI clients
 ```
 
 ## Build & run

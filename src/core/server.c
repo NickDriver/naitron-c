@@ -63,6 +63,7 @@ typedef struct conn {
     int kind;            /* KIND_HTTP (must be first) */
     int fd;
     int state;
+    bool is_admin;       /* connection arrived on the admin port */
     struct gateway *gw;
     bool inflight;
     uint32_t req_id;
@@ -105,12 +106,21 @@ typedef struct cctrl {
     char buf[4096];
 } cctrl;
 
+typedef struct metrics {
+    long start_ms;
+    uint64_t requests_total;
+    uint64_t status_2xx, status_4xx, status_5xx;
+    uint64_t forwarded, builtin;
+} metrics;
+
 typedef struct gateway {
     ntc_poller *p;
     ntc_router *router;
     ntc_registry *reg;
     int listen_fd;
+    int admin_fd;
     int control_fd;
+    metrics m;
     char token[65];
     service *services;   /* fixed array, cap NTC_MAX_SERVICES (stable pointers) */
     size_t nservices;
@@ -174,6 +184,13 @@ static void gw_free_slot(gateway *g, uint16_t slot) {
     g->free_slots[g->free_top++] = slot;
 }
 
+static void rec_status(gateway *g, int status) {
+    g->m.requests_total++;
+    if (status >= 500) g->m.status_5xx++;
+    else if (status >= 400) g->m.status_4xx++;
+    else if (status >= 200 && status < 300) g->m.status_2xx++;
+}
+
 /* ---- connections ---- */
 static conn *conn_new(gateway *g, int fd) {
     conn *c = calloc(1, sizeof *c);
@@ -209,6 +226,7 @@ static int conn_flush(gateway *g, conn *c) {
 }
 
 static int respond_and_flush(gateway *g, conn *c, int status, ntc_slice json) {
+    if (!c->is_admin) rec_status(g, status);
     if (conn_respond(c, status, JSON, json) != 0) { conn_close(g, c); return -1; }
     return conn_flush(g, c);
 }
@@ -256,6 +274,7 @@ static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t l
         (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"bad upstream response\"}"));
         return;
     }
+    rec_status(g, status);
     if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return; }
     (void)conn_flush(g, c);
 }
@@ -370,13 +389,120 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
         return respond_and_flush(g, c, 404, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
     if (rs == NTC_ROUTE_METHOD_NOT_ALLOWED)
         return respond_and_flush(g, c, 405, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
-    if (h == forward_marker) return gw_forward(g, c, req, (service *)udata);
+    if (h == forward_marker) { g->m.forwarded++; return gw_forward(g, c, req, (service *)udata); }
 
+    g->m.builtin++;
     ntc_response res = { .status = 200, .content_type = JSON, .body = NTC_SLICE_LIT("") };
     if (h(req, &params, &res, &c->arena, udata) != 0)
         return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"internal error\"}"));
+    rec_status(g, res.status);
     if (conn_respond(c, res.status, res.content_type, res.body) != 0) { conn_close(g, c); return -1; }
     return conn_flush(g, c);
+}
+
+/* ---- admin endpoint: read-only dashboard + stats (localhost) ---- */
+static const char *DASHBOARD_HTML =
+"<!doctype html>\n"
+"<html lang='en'><head><meta charset='utf-8'>\n"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+"<title>naitron-c</title><style>\n"
+"*{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:#0e1116;color:#e6edf3}\n"
+"header{padding:16px 24px;border-bottom:1px solid #222b36;display:flex;align-items:center;gap:12px}\n"
+"header h1{font-size:18px;margin:0;font-weight:600}.dot{width:9px;height:9px;border-radius:50%;background:#2ea043;box-shadow:0 0 8px #2ea043}\n"
+".tabs{display:flex;gap:4px;padding:12px 24px 0}.tab{padding:8px 16px;border:none;background:none;color:#9aa7b3;cursor:pointer;border-radius:8px 8px 0 0;font-size:14px}\n"
+".tab.active{color:#e6edf3;background:#161b22}main{padding:24px}\n"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}\n"
+".card{background:#161b22;border:1px solid #222b36;border-radius:12px;padding:16px}.card .k{color:#9aa7b3;font-size:12px;text-transform:uppercase;letter-spacing:.5px}.card .v{font-size:28px;font-weight:700;margin-top:6px}\n"
+"table{width:100%;border-collapse:collapse;background:#161b22;border-radius:12px;overflow:hidden}th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #222b36;font-size:13px}th{color:#9aa7b3;font-weight:600}\n"
+".pill{padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}.up{background:#13351f;color:#3fb950}.down{background:#3d1d1d;color:#f85149}.disabled{background:#2a2f37;color:#9aa7b3}\n"
+".hidden{display:none}.muted{color:#9aa7b3}\n"
+"</style></head><body>\n"
+"<header><span class='dot'></span><h1>naitron-c</h1><span class='muted' id='sub'>dashboard</span></header>\n"
+"<div class='tabs'><button class='tab active' data-t='overview'>Overview</button>"
+"<button class='tab' data-t='services'>Services</button><button class='tab' data-t='routes'>Routes</button></div>\n"
+"<main>\n"
+" <section id='overview'><div class='grid' id='stats'></div></section>\n"
+" <section id='services' class='hidden'><table><thead><tr><th>Service</th><th>Status</th><th>Binary</th><th>Restarts</th><th>Uptime</th></tr></thead><tbody id='svcbody'></tbody></table></section>\n"
+" <section id='routes' class='hidden'><table><thead><tr><th>Method</th><th>Pattern</th><th>Service</th></tr></thead><tbody id='rtbody'></tbody></table></section>\n"
+"</main><script>\n"
+"const $=s=>document.querySelector(s);\n"
+"document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');['overview','services','routes'].forEach(id=>$('#'+id).classList.toggle('hidden',id!==b.dataset.t));});\n"
+"function fu(s){if(s<60)return s+'s';if(s<3600)return (s/60|0)+'m';return (s/3600|0)+'h '+((s%3600)/60|0)+'m';}\n"
+"async function tick(){try{\n"
+" const s=await (await fetch('/api/stats')).json();\n"
+" $('#sub').textContent=s.backend+' \\u00b7 up '+fu(s.uptime_s);\n"
+" const c=[['Requests',s.requests_total],['2xx',s.status_2xx],['4xx',s.status_4xx],['5xx',s.status_5xx],['Forwarded',s.forwarded],['Built-in',s.builtin],['Services',s.services],['Routes',s.routes]];\n"
+" $('#stats').innerHTML=c.map(x=>`<div class='card'><div class='k'>${x[0]}</div><div class='v'>${x[1]}</div></div>`).join('');\n"
+" const sv=await (await fetch('/api/services')).json();\n"
+" $('#svcbody').innerHTML=sv.length?sv.map(x=>`<tr><td>${x.name}</td><td><span class='pill ${x.status}'>${x.status}</span></td><td class='muted'>${x.bin}</td><td>${x.restarts}</td><td>${x.status==='up'?fu(x.uptime_s):'-'}</td></tr>`).join(''):`<tr><td colspan=5 class='muted'>no services</td></tr>`;\n"
+" const rt=await (await fetch('/api/routes')).json();\n"
+" $('#rtbody').innerHTML=rt.length?rt.map(x=>`<tr><td>${x.method}</td><td>${x.pattern}</td><td>${x.service}</td></tr>`).join(''):`<tr><td colspan=3 class='muted'>no routes</td></tr>`;\n"
+" }catch(e){$('#sub').textContent='disconnected';}}\n"
+"tick();setInterval(tick,1500);\n"
+"</script></body></html>\n";
+
+static int admin_send(gateway *g, conn *c, int status, ntc_slice ctype, ntc_slice body) {
+    if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return -1; }
+    return conn_flush(g, c);
+}
+
+static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
+    if (!ntc_slice_eq_cstr(req->method, "GET"))
+        return admin_send(g, c, 405, JSON, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
+
+    if (ntc_slice_eq_cstr(req->path, "/") || ntc_slice_eq_cstr(req->path, "/index.html"))
+        return admin_send(g, c, 200, NTC_SLICE_LIT("text/html; charset=utf-8"),
+                          ntc_slice_cstr(DASHBOARD_HTML));
+
+    if (ntc_slice_eq_cstr(req->path, "/api/stats")) {
+        char *buf = ntc_arena_alloc(&c->arena, 1024);
+        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("{}"));
+        long up = (now_ms() - g->m.start_ms) / 1000;
+        int m = snprintf(buf, 1024,
+            "{\"uptime_s\":%ld,\"requests_total\":%llu,\"status_2xx\":%llu,\"status_4xx\":%llu,"
+            "\"status_5xx\":%llu,\"forwarded\":%llu,\"builtin\":%llu,\"services\":%zu,"
+            "\"routes\":%zu,\"backend\":\"%s\",\"inflight_cap\":%u}",
+            up, (unsigned long long)g->m.requests_total, (unsigned long long)g->m.status_2xx,
+            (unsigned long long)g->m.status_4xx, (unsigned long long)g->m.status_5xx,
+            (unsigned long long)g->m.forwarded, (unsigned long long)g->m.builtin,
+            g->nservices, ntc_router_count(g->router), ntc_poller_backend(), NTC_MAX_INFLIGHT);
+        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, (size_t)(m < 0 ? 0 : m)));
+    }
+
+    if (ntc_slice_eq_cstr(req->path, "/api/services")) {
+        size_t cap = 64 * 1024;
+        char *buf = ntc_arena_alloc(&c->arena, cap);
+        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
+        long t = now_ms();
+        size_t off = (size_t)snprintf(buf, cap, "[");
+        for (size_t i = 0; i < g->nservices && off < cap - 512; i++) {
+            service *svc = &g->services[i];
+            const char *st = svc->disabled ? "disabled" : (svc->conn ? "up" : "down");
+            long up = svc->conn ? (t - svc->spawned_at) / 1000 : 0;
+            off += (size_t)snprintf(buf + off, cap - off,
+                "%s{\"name\":\"%s\",\"bin\":\"%s\",\"status\":\"%s\",\"restarts\":%d,\"uptime_s\":%ld}",
+                i ? "," : "", svc->name, svc->bin, st, svc->restart_count, up);
+        }
+        off += (size_t)snprintf(buf + off, cap - off, "]");
+        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, off));
+    }
+
+    if (ntc_slice_eq_cstr(req->path, "/api/routes")) {
+        ntc_route_row rows[256]; size_t n = 0;
+        (void)ntc_registry_list_routes(g->reg, rows, 256, &n);
+        size_t cap = 64 * 1024;
+        char *buf = ntc_arena_alloc(&c->arena, cap);
+        if (!buf) return admin_send(g, c, 500, JSON, NTC_SLICE_LIT("[]"));
+        size_t off = (size_t)snprintf(buf, cap, "[");
+        for (size_t i = 0; i < n && off < cap - 512; i++)
+            off += (size_t)snprintf(buf + off, cap - off,
+                "%s{\"method\":\"%s\",\"pattern\":\"%s\",\"service\":\"%s\"}",
+                i ? "," : "", rows[i].method, rows[i].pattern, rows[i].service);
+        off += (size_t)snprintf(buf + off, cap - off, "]");
+        return admin_send(g, c, 200, JSON, ntc_slice_new(buf, off));
+    }
+
+    return admin_send(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
 }
 
 static int on_readable(gateway *g, conn *c) {
@@ -413,7 +539,7 @@ static int on_readable(gateway *g, conn *c) {
         if (c->rlen < sizeof c->rbuf) return 0;
         return respond_and_flush(g, c, 413, NTC_SLICE_LIT("{\"error\":\"body too large\"}"));
     }
-    return gw_dispatch(g, c, &req);
+    return c->is_admin ? handle_admin(g, c, &req) : gw_dispatch(g, c, &req);
 }
 
 static void on_wait_readable(gateway *g, conn *c) {
@@ -424,9 +550,9 @@ static void on_wait_readable(gateway *g, conn *c) {
         conn_close(g, c);
 }
 
-static void accept_all(gateway *g) {
+static void accept_conns(gateway *g, int listen_fd, bool is_admin) {
     for (;;) {
-        int cfd = accept(g->listen_fd, NULL, NULL);
+        int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -440,10 +566,30 @@ static void accept_all(gateway *g) {
 #endif
         conn *c = conn_new(g, cfd);
         if (!c) { close(cfd); continue; }
+        c->is_admin = is_admin;
         if (ntc_poller_add(g->p, cfd, NTC_POLL_READ, c) != NTC_OK) {
             ntc_arena_destroy(&c->arena); close(cfd); free(c);
         }
     }
+}
+
+static int make_admin_socket(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* dashboard: localhost only */
+    addr.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { close(fd); return -1; }
+    if (listen(fd, 64) < 0) { close(fd); return -1; }
+    if (set_nonblocking(fd) < 0) { close(fd); return -1; }
+    return fd;
 }
 
 /* ---- spawn + supervise ---- */
@@ -791,11 +937,10 @@ static void accept_control(gateway *g) {
 }
 
 ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
-    (void)admin_port; /* read-only dashboard: P8 */
-
     gateway g;
     memset(&g, 0, sizeof g);
     gw_slots_init(&g);
+    g.m.start_ms = now_ms();
 
     if (ntc_router_create(&g.router) != NTC_OK) return NTC_ERR_OOM;
     if (ntc_builtin_register(g.router) != NTC_OK) { ntc_router_destroy(g.router); return NTC_ERR_INTERNAL; }
@@ -808,6 +953,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         return NTC_ERR_IO;
     }
     g.control_fd = -1;
+    g.admin_fd = -1;
     g.services = calloc(NTC_MAX_SERVICES, sizeof(service));
     if (!g.services) { ntc_registry_close(g.reg); ntc_router_destroy(g.router); return NTC_ERR_OOM; }
     load_token(&g);
@@ -857,6 +1003,19 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         NTC_WARN("control socket '%s' unavailable; CLI control disabled", csock);
     }
 
+    if (admin_port > 0) {
+        g.admin_fd = make_admin_socket(admin_port);
+        if (g.admin_fd >= 0) {
+            if (ntc_poller_add(g.p, g.admin_fd, NTC_POLL_READ, NULL) != NTC_OK) {
+                close(g.admin_fd); g.admin_fd = -1;
+            } else {
+                NTC_SUCCESS("dashboard on http://127.0.0.1:%u  (read-only)", (unsigned)admin_port);
+            }
+        } else {
+            NTC_WARN("admin port %u unavailable; dashboard disabled", (unsigned)admin_port);
+        }
+    }
+
     if (load_registry(&g) != NTC_OK) NTC_WARN("registry load incomplete");
     for (size_t i = 0; i < g.nservices; i++) (void)spawn_service(&g, &g.services[i]);
 
@@ -873,7 +1032,8 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
             break;
         }
         for (int i = 0; i < n; i++) {
-            if (evs[i].fd == listen_fd) { accept_all(&g); continue; }
+            if (evs[i].fd == listen_fd) { accept_conns(&g, listen_fd, false); continue; }
+            if (evs[i].fd == g.admin_fd) { accept_conns(&g, g.admin_fd, true); continue; }
             if (evs[i].fd == g.control_fd) { accept_control(&g); continue; }
             int kind = *(int *)evs[i].udata;
             if (kind == KIND_CONTROL) {
@@ -912,6 +1072,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     free(g.services);
     ntc_poller_destroy(g.p);
     close(listen_fd);
+    if (g.admin_fd >= 0) close(g.admin_fd);
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
