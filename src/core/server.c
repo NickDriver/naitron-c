@@ -12,6 +12,7 @@
 #include "ntc/registry.h"
 #include "ntc/router.h"
 #include "ntc/slice.h"
+#include "ntc/tls.h"
 #include "ntc/version.h"
 #include "ntc/wire.h"
 
@@ -70,6 +71,7 @@ typedef struct conn {
     int fd;
     int state;
     bool is_admin;       /* connection arrived on the admin port */
+    struct ntc_tls *tls; /* non-NULL for HTTPS connections (TLS termination) */
     struct gateway *gw;
     bool inflight;
     uint32_t req_id;
@@ -136,6 +138,8 @@ typedef struct gateway {
     int listen_fd;
     int admin_fd;
     int control_fd;
+    int tls_fd;          /* HTTPS listener; -1 = disabled */
+    ntc_tls_conf *tls_conf;
     metrics m;
     ntc_mw *mw;
     char token[65];
@@ -153,6 +157,10 @@ typedef struct gateway {
 static void conn_close(gateway *g, conn *c);
 static int  on_writable(gateway *g, conn *c);
 static int  respond_and_flush(gateway *g, conn *c, int status, ntc_slice json);
+static int  process_request(gateway *g, conn *c, bool eof);
+static int  tls_drive_write(gateway *g, conn *c);
+static int  tls_set_interest(gateway *g, conn *c);
+static void on_tls_event(gateway *g, conn *c);
 static void controller_died(gateway *g, ctrl *ct);
 static int  spawn_service(gateway *g, service *svc);
 static void exec_control_command(gateway *g, char *cmdline, char *out, size_t cap);
@@ -228,6 +236,7 @@ static void conn_close(gateway *g, conn *c) {
     if (c->inflight) { gw_free_slot(g, (uint16_t)(c->req_id & NTC_INFLIGHT_MASK)); c->inflight = false; }
     (void)ntc_poller_del(g->p, c->fd);
     close(c->fd);
+    if (c->tls) ntc_tls_free(c->tls);
     ntc_arena_destroy(&c->arena);
     free(c);
 }
@@ -248,6 +257,11 @@ static int conn_respond(conn *c, int status, ntc_slice ctype, ntc_slice body) {
 }
 
 static int conn_flush(gateway *g, conn *c) {
+    if (c->tls) {
+        int rc = tls_drive_write(g, c);
+        if (rc < 0) return rc;            /* conn closed (done or error) */
+        return tls_set_interest(g, c);    /* re-arm WRITE if records still pending */
+    }
     if (ntc_poller_mod(g->p, c->fd, NTC_POLL_WRITE, c) != NTC_OK) { conn_close(g, c); return -1; }
     return on_writable(g, c);
 }
@@ -265,6 +279,7 @@ static int send_resp(gateway *g, conn *c, int status, ntc_slice ctype, ntc_slice
 }
 
 static int on_writable(gateway *g, conn *c) {
+    if (c->tls) return tls_drive_write(g, c);
     while (c->wsent < c->wlen) {
         ssize_t n = send(c->fd, c->wbuf + c->wsent, c->wlen - c->wsent, MSG_NOSIGNAL);
         if (n > 0) { c->wsent += (size_t)n; continue; }
@@ -706,19 +721,10 @@ static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
     return send_resp(g, c, 404, JSON, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
 }
 
-static int on_readable(gateway *g, conn *c) {
-    bool eof = false;
-    for (;;) {
-        if (c->rlen >= sizeof c->rbuf) break;
-        ssize_t n = recv(c->fd, c->rbuf + c->rlen, sizeof c->rbuf - c->rlen, 0);
-        if (n > 0) { c->rlen += (size_t)n; continue; }
-        if (n == 0) { eof = true; break; }
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        conn_close(g, c);
-        return -1;
-    }
-
+/* Parse whatever is buffered in c->rbuf and run the middleware + dispatch. The
+ * transport (recv() or TLS) fills c->rbuf first; `eof` means end-of-stream.
+ * Returns <0 if the connection was closed - the caller must stop touching it. */
+static int process_request(gateway *g, conn *c, bool eof) {
     ntc_request req;
     size_t consumed = 0;
     ntc_parse_result pr = ntc_http_parse_request(c->rbuf, c->rlen, &req, &consumed);
@@ -760,6 +766,83 @@ static int on_readable(gateway *g, conn *c) {
     return c->is_admin ? handle_admin(g, c, &req) : gw_dispatch(g, c, &req);
 }
 
+static int on_readable(gateway *g, conn *c) {
+    bool eof = false;
+    for (;;) {
+        if (c->rlen >= sizeof c->rbuf) break;
+        ssize_t n = recv(c->fd, c->rbuf + c->rlen, sizeof c->rbuf - c->rlen, 0);
+        if (n > 0) { c->rlen += (size_t)n; continue; }
+        if (n == 0) { eof = true; break; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        conn_close(g, c);
+        return -1;
+    }
+    return process_request(g, c, eof);
+}
+
+/* ---- TLS connection driver ----
+ * A TLS conn is driven by a single handler on any readable/writable event.
+ * ntc_tls_pump_socket() moves encrypted bytes both ways (and runs the
+ * handshake); we then feed decrypted bytes to the HTTP layer and encrypt the
+ * response back through the engine. The plaintext path above is untouched. */
+
+static int tls_set_interest(gateway *g, conn *c) {
+    uint32_t ev = NTC_POLL_READ;
+    if (ntc_tls_wants_write(c->tls)) ev |= NTC_POLL_WRITE;
+    if (c->state == CS_WRITE && c->wsent < c->wlen) ev |= NTC_POLL_WRITE;
+    if (ntc_poller_mod(g->p, c->fd, ev, c) != NTC_OK) { conn_close(g, c); return -1; }
+    return 0;
+}
+
+/* Push c->wbuf through the engine and out to the socket. Returns <0 if the
+ * connection was closed (response fully sent, or error). */
+static int tls_drive_write(gateway *g, conn *c) {
+    for (;;) {
+        size_t before = c->wsent;
+        while (c->wsent < c->wlen) {
+            int n = ntc_tls_send(c->tls, c->wbuf + c->wsent, c->wlen - c->wsent);
+            if (n <= 0) break;
+            c->wsent += (size_t)n;
+        }
+        if (c->wsent >= c->wlen) { ntc_tls_flush(c->tls); ntc_tls_close_notify(c->tls); }
+        if (ntc_tls_pump_socket(c->tls, c->fd) < 0) { conn_close(g, c); return -1; }
+        if (ntc_tls_closed(c->tls)) { conn_close(g, c); return -1; }
+        if (ntc_tls_wants_write(c->tls)) return 0;       /* socket full: await writable */
+        if (c->wsent >= c->wlen) { conn_close(g, c); return -1; } /* fully delivered */
+        if (c->wsent == before) return 0;                /* no progress: avoid spin */
+    }
+}
+
+/* Drain decrypted request bytes into c->rbuf, then parse + dispatch. */
+static int tls_drive_read(gateway *g, conn *c) {
+    bool got = false;
+    while (c->rlen < sizeof c->rbuf) {
+        int n = ntc_tls_recv(c->tls, c->rbuf + c->rlen, sizeof c->rbuf - c->rlen);
+        if (n <= 0) break;
+        c->rlen += (size_t)n; got = true;
+    }
+    bool eof = ntc_tls_closed(c->tls);
+    if (!got && !eof) return 0; /* still handshaking or waiting for more */
+    return process_request(g, c, eof);
+}
+
+static void on_tls_event(gateway *g, conn *c) {
+    if (ntc_tls_pump_socket(c->tls, c->fd) < 0) { conn_close(g, c); return; }
+    int rc = 0;
+    if (c->state == CS_READ) {
+        rc = tls_drive_read(g, c);
+    } else if (c->state == CS_WAIT) {
+        char tmp[256];
+        while (ntc_tls_recv(c->tls, tmp, sizeof tmp) > 0) { } /* discard until response */
+        if (ntc_tls_closed(c->tls)) { conn_close(g, c); return; }
+    } else { /* CS_WRITE */
+        rc = tls_drive_write(g, c);
+    }
+    if (rc < 0) return; /* conn closed by the drive */
+    (void)tls_set_interest(g, c);
+}
+
 static void on_wait_readable(gateway *g, conn *c) {
     char tmp[256];
     ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
@@ -768,7 +851,7 @@ static void on_wait_readable(gateway *g, conn *c) {
         conn_close(g, c);
 }
 
-static void accept_conns(gateway *g, int listen_fd, bool is_admin) {
+static void accept_conns(gateway *g, int listen_fd, bool is_admin, bool is_tls) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
@@ -787,11 +870,16 @@ static void accept_conns(gateway *g, int listen_fd, bool is_admin) {
         conn *c = conn_new(g, cfd);
         if (!c) { close(cfd); continue; }
         c->is_admin = is_admin;
+        if (is_tls) {
+            c->tls = ntc_tls_new(g->tls_conf);
+            if (!c->tls) { ntc_arena_destroy(&c->arena); close(cfd); free(c); continue; }
+        }
         if (ss.ss_family == AF_INET)
             inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, c->client_ip, sizeof c->client_ip);
         else if (ss.ss_family == AF_INET6)
             inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, c->client_ip, sizeof c->client_ip);
         if (ntc_poller_add(g->p, cfd, NTC_POLL_READ, c) != NTC_OK) {
+            if (c->tls) ntc_tls_free(c->tls);
             ntc_arena_destroy(&c->arena); close(cfd); free(c);
         }
     }
@@ -812,6 +900,27 @@ static int make_admin_socket(uint16_t port) {
     addr.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { close(fd); return -1; }
     if (listen(fd, 64) < 0) { close(fd); return -1; }
+    if (set_nonblocking(fd) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* HTTPS listener: bound on all interfaces (a public-facing port, like the
+ * plaintext gateway). */
+static int make_tls_socket(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { close(fd); return -1; }
+    if (listen(fd, 256) < 0) { close(fd); return -1; }
     if (set_nonblocking(fd) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -1189,10 +1298,11 @@ static void accept_control(gateway *g) {
     }
 }
 
-ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
+ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
     gateway g;
     memset(&g, 0, sizeof g);
     gw_slots_init(&g);
+    g.tls_fd = -1;
     g.m.start_ms = now_ms();
 
     if (ntc_router_create(&g.router) != NTC_OK) return NTC_ERR_OOM;
@@ -1316,6 +1426,39 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
         }
     }
 
+    {
+        /* HTTPS listener. Port: CLI --tls wins, else tls.port / NTC_TLS_PORT.
+         * Cert + key (both PEM): tls.cert/tls.key or NTC_TLS_CERT/NTC_TLS_KEY. */
+        uint16_t tport = tls_port;
+        char vv[256]; bool ff = false;
+        if (!tport && ntc_registry_get_config(g.reg, "tls.port", vv, sizeof vv, &ff) == NTC_OK && ff)
+            tport = (uint16_t)atoi(vv);
+        const char *tpe = getenv("NTC_TLS_PORT"); if (tpe) tport = (uint16_t)atoi(tpe);
+
+        char cert[256] = "", key[256] = "";
+        if (ntc_registry_get_config(g.reg, "tls.cert", vv, sizeof vv, &ff) == NTC_OK && ff)
+            snprintf(cert, sizeof cert, "%s", vv);
+        if (ntc_registry_get_config(g.reg, "tls.key", vv, sizeof vv, &ff) == NTC_OK && ff)
+            snprintf(key, sizeof key, "%s", vv);
+        const char *ce = getenv("NTC_TLS_CERT"); if (ce) snprintf(cert, sizeof cert, "%s", ce);
+        const char *ke = getenv("NTC_TLS_KEY");  if (ke) snprintf(key, sizeof key, "%s", ke);
+
+        if (tport > 0) {
+            if (!cert[0] || !key[0]) {
+                NTC_WARN("tls: port %u set but tls.cert/tls.key missing; HTTPS disabled", (unsigned)tport);
+            } else if (!(g.tls_conf = ntc_tls_conf_new(cert, key))) {
+                NTC_WARN("tls: failed to load cert/key; HTTPS disabled");
+            } else if ((g.tls_fd = make_tls_socket(tport)) < 0 ||
+                       ntc_poller_add(g.p, g.tls_fd, NTC_POLL_READ, NULL) != NTC_OK) {
+                if (g.tls_fd >= 0) { close(g.tls_fd); g.tls_fd = -1; }
+                ntc_tls_conf_free(g.tls_conf); g.tls_conf = NULL;
+                NTC_WARN("tls: port %u unavailable; HTTPS disabled", (unsigned)tport);
+            } else {
+                NTC_SUCCESS("naitron-c TLS on https://0.0.0.0:%u", (unsigned)tport);
+            }
+        }
+    }
+
     if (load_registry(&g) != NTC_OK) NTC_WARN("registry load incomplete");
     for (size_t i = 0; i < g.nservices; i++) (void)spawn_service(&g, &g.services[i]);
 
@@ -1332,8 +1475,9 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
             break;
         }
         for (int i = 0; i < n; i++) {
-            if (evs[i].fd == listen_fd) { accept_conns(&g, listen_fd, false); continue; }
-            if (evs[i].fd == g.admin_fd) { accept_conns(&g, g.admin_fd, true); continue; }
+            if (evs[i].fd == listen_fd) { accept_conns(&g, listen_fd, false, false); continue; }
+            if (evs[i].fd == g.admin_fd) { accept_conns(&g, g.admin_fd, true, false); continue; }
+            if (g.tls_fd >= 0 && evs[i].fd == g.tls_fd) { accept_conns(&g, g.tls_fd, false, true); continue; }
             if (evs[i].fd == g.control_fd) { accept_control(&g); continue; }
             int kind = *(int *)evs[i].udata;
             if (kind == KIND_CONTROL) {
@@ -1347,6 +1491,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
                 continue;
             }
             conn *c = evs[i].udata;
+            if (c->tls) { on_tls_event(&g, c); continue; }
             if (c->state == CS_READ) {
                 if ((evs[i].events & NTC_POLL_READ) && on_readable(&g, c) < 0) continue;
             } else if (c->state == CS_WAIT) {
@@ -1373,6 +1518,8 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
     ntc_poller_destroy(g.p);
     close(listen_fd);
     if (g.admin_fd >= 0) close(g.admin_fd);
+    if (g.tls_fd >= 0) close(g.tls_fd);
+    if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_mw_free(g.mw);
     ntc_registry_close(g.reg);
@@ -1381,6 +1528,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port) {
 
 fail_pre_poll:
     free(g.services);
+    if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     ntc_mw_free(g.mw);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);

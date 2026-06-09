@@ -5,14 +5,15 @@ One central **gateway** routes each `/api/*` route to an isolated **controller**
 process; a small **core/orchestrator** supervises them. Control is via the `ntc`
 CLI and a built-in MCP server; observability via a read-only dashboard.
 
-> Status: **M1–M6 implemented** (on top of feature-complete P1–P8). UX/DX
+> Status: **M1–M7 implemented** (on top of feature-complete P1–P8). UX/DX
 > (detached daemon, formatted CLI, dashboard-by-default, `/_ntc/*`, MCP-over-HTTP);
 > a **middleware** chain (request-id, access-log, CORS, rate-limit); **auth**
-> (API keys + HS256 JWT, crypto from scratch verified against RFC vectors);
-> **controller DX** (path params + query + auth identity over the frozen v2 wire,
-> `ntc_reply_json`, `ntc new controller`); **SDKs in Python, TypeScript, Go, Rust**
-> (`sdk/`); **static file serving** + **auto-OpenAPI** (`/_ntc/openapi.json`).
-> Deferred (need BearSSL or streaming conns): RS256/OAuth-login, TLS, SSE, gzip,
+> (API keys + HS256 **and RS256** JWT — HS256/HMAC from scratch, RS256 + TLS via
+> vendored **BearSSL**); **controller DX** (path params + query + auth identity over
+> the frozen v2 wire, `ntc_reply_json`, `ntc new controller`); **SDKs in Python,
+> TypeScript, Go, Rust** (`sdk/`); **static file serving** + **auto-OpenAPI**
+> (`/_ntc/openapi.json`); **TLS termination** (`--tls <port>`).
+> Deferred (follow-up): live JWKS-over-HTTPS, OAuth-login, ES256, SSE, gzip,
 > `ntc dev`, worker pools — see `docs/DECISIONS.md`. Roadmap: `docs/SPEC.md`.
 
 ## CLI
@@ -25,7 +26,24 @@ ntc route add GET /api/hello hello          # route to a service (live)
 ntc service list ; ntc route list
 ntc service rm hello ; ntc stop ; ntc token
 ntc start 3000 --admin 9000                 # + read-only dashboard on :9000
+ntc start 3000 --tls 3443                    # + HTTPS on :3443 (needs tls.cert/tls.key)
 ntc mcp                                      # built-in MCP server (stdio) for AI clients
+```
+
+### Auth & TLS config
+
+```sh
+# RS256 JWT: verify against a static JWKS/JWK public-key document
+ntc config set auth.mode jwt
+ntc config set auth.jwks_file ./jwks.json          # or NTC_AUTH_JWKS_FILE
+ntc config set auth.protect /api/                  # prefix to protect ("" = all)
+# (HS256 still works via auth.secret; the token's own `alg` selects the path.)
+
+# TLS termination (PEM cert chain + RSA private key)
+ntc config set tls.cert ./cert.pem                 # or NTC_TLS_CERT
+ntc config set tls.key  ./key.pem                  # or NTC_TLS_KEY
+ntc config set tls.port 3443                        # or --tls 3443 / NTC_TLS_PORT
+# dev cert:  openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -subj /CN=localhost
 ```
 
 ## Build & run

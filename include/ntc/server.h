@@ -6,8 +6,9 @@
 #include <stdint.h>
 #include "ntc/err.h"
 
-/* Bind `port`, accept connections, answer a fixed JSON 200 until SIGINT/SIGTERM.
- * `admin_port` is reserved for the read-only dashboard (P8); 0 = disabled. */
-NTC_NODISCARD ntc_err ntc_server_run(uint16_t port, uint16_t admin_port);
+/* Bind `port`, accept connections, serve until SIGINT/SIGTERM.
+ * `admin_port` is the read-only dashboard (0 = disabled).
+ * `tls_port` is an optional HTTPS listener (0 = disabled; needs tls.cert/key). */
+NTC_NODISCARD ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port);
 
 #endif /* NTC_SERVER_H */

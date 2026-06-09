@@ -182,6 +182,11 @@ dependencies (wire freeze must precede the SDKs).
 - **M6 — Full-stack & modern:** static file serving, SSE streaming (AI tokens),
   auto-OpenAPI from the registry, `ntc dev` (watch+reload), worker pools (N
   procs/service), TLS termination, gzip, multipart/uploads.
+- **M7 — BearSSL: RS256 + TLS (DONE 2026-06-09).** Vendored BearSSL (submodule).
+  **RS256** JWT verify via a static JWKS/JWK key (`auth.jwks_file`); middleware
+  dispatches HS256/RS256 per token `alg`. **TLS termination** via `br_ssl_server`
+  driven through the non-blocking event loop (`--tls <port>` + `tls.cert`/`tls.key`).
+  Follow-up: live JWKS-over-HTTPS (TLS client), OAuth2 login, ES256.
 
 ---
 

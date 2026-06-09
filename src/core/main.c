@@ -41,7 +41,8 @@ static void usage(const char *p) {
     fprintf(stderr,
         NTC_NAME " " NTC_VERSION " - microkernel web framework\n\n"
         "usage:\n"
-        "  %s start <port> [-d] [--dashboard <port>|--no-dashboard]   start the core\n"
+        "  %s start <port> [-d] [--dashboard <port>|--no-dashboard] [--tls <port>]\n"
+        "                                                             start the core\n"
         "  %s stop | restart <port>                                   stop / restart\n"
         "  %s logs [-f]                                               tail the log\n"
         "  %s status [--json]                                         core status\n"
@@ -170,12 +171,15 @@ static int run_start(const char *prog, int argc, char **argv) {
     if (parse_port(argv[2], &port) != 0) { cli_errorf("invalid port '%s' (1-65535)", argv[2]); return 2; }
 
     uint16_t dash = NTC_DASHBOARD_DEFAULT;
+    uint16_t tls_port = 0;
     bool detach = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--detach") == 0) detach = true;
         else if (strcmp(argv[i], "--no-dashboard") == 0) dash = 0;
         else if ((strcmp(argv[i], "--dashboard") == 0 || strcmp(argv[i], "--admin") == 0) && i + 1 < argc) {
             if (parse_port(argv[++i], &dash) != 0) { cli_errorf("invalid dashboard port '%s'", argv[i]); return 2; }
+        } else if (strcmp(argv[i], "--tls") == 0 && i + 1 < argc) {
+            if (parse_port(argv[++i], &tls_port) != 0) { cli_errorf("invalid TLS port '%s'", argv[i]); return 2; }
         } else { cli_errorf("unknown argument '%s'", argv[i]); return 2; }
     }
 
@@ -194,7 +198,7 @@ static int run_start(const char *prog, int argc, char **argv) {
         write_pidfile(getpid());
     }
 
-    ntc_err e = ntc_server_run(port, dash);
+    ntc_err e = ntc_server_run(port, dash, tls_port);
     unlink(pidfile_path());
     if (e != NTC_OK) { NTC_ERROR("server exited: %s", ntc_err_str(e)); return 1; }
     return 0;

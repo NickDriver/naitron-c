@@ -65,3 +65,53 @@ ITEST(m7, rs256_jwt_auth) {
 
     it_stop(srv);
 }
+
+/* TLS termination. The C it_util harness speaks plaintext only, so we drive the
+ * HTTPS side with `curl -k` (a committed self-signed localhost cert lives in
+ * tests/vectors/tls.*). Skips cleanly if curl is unavailable. */
+static bool have_curl(void) { return system("command -v curl >/dev/null 2>&1") == 0; }
+
+/* Run `cmd`, capture trimmed stdout into out. Returns true on a clean exit. */
+static bool run_capture(const char *cmd, char *out, size_t cap) {
+    FILE *p = popen(cmd, "r");
+    if (!p) return false;
+    size_t n = fread(out, 1, cap - 1, p);
+    out[n] = '\0';
+    return pclose(p) == 0;
+}
+
+ITEST(m7, tls_termination) {
+    if (!have_curl()) SKIP("curl not available");
+    it_iso("m7tls");
+    setenv("NTC_TLS_CERT", "tests/vectors/tls.cert.pem", 1);
+    setenv("NTC_TLS_KEY", "tests/vectors/tls.key.pem", 1);
+    const char *argv[] = { "./build/ntc", "start", "38151", "--no-dashboard", "--tls", "38152", NULL };
+    pid_t srv = it_spawn(argv);
+    unsetenv("NTC_TLS_CERT"); unsetenv("NTC_TLS_KEY");
+    ASSERT_TRUE(srv > 0);
+    ASSERT_TRUE(it_wait_port(38152, 4000)); /* TLS listener accepting */
+
+    char out[4096];
+
+    /* HTTPS GET -> 200 with the health body, proving the handshake + record
+     * pump + HTTP layer all work over TLS. */
+    ASSERT_TRUE(run_capture(
+        "curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:38152/_ntc/health",
+        out, sizeof out));
+    ASSERT_TRUE(strcmp(out, "200") == 0);
+
+    ASSERT_TRUE(run_capture("curl -sk https://127.0.0.1:38152/_ntc/health", out, sizeof out));
+    ASSERT_TRUE(strstr(out, "\"status\":\"ok\"") != NULL);
+
+    /* A larger body (landing page) exercises multi-chunk writes through the engine. */
+    ASSERT_TRUE(run_capture(
+        "curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:38152/", out, sizeof out));
+    ASSERT_TRUE(strcmp(out, "200") == 0);
+
+    /* Plaintext listener still serves in parallel. */
+    char resp[4096];
+    ASSERT_TRUE(it_get(38151, "/_ntc/health", resp, sizeof resp) > 0);
+    ASSERT_EQ_INT(200, it_status(resp));
+
+    it_stop(srv);
+}
