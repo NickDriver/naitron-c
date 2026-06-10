@@ -43,6 +43,8 @@ static void usage(const char *p) {
         "usage:\n"
         "  %s start <port> [-d] [--dashboard <port>|--no-dashboard] [--tls <port>]\n"
         "                                                             start the core\n"
+        "  %s dev <port> [--build \"<cmd>\"] [--watch <path>]... [--tls <port>]\n"
+        "                                          foreground + mtime hot-reload\n"
         "  %s stop | restart <port>                                   stop / restart\n"
         "  %s logs [-f]                                               tail the log\n"
         "  %s status [--json]                                         core status\n"
@@ -51,7 +53,7 @@ static void usage(const char *p) {
         "  %s config set <key> <value> | get <key>\n"
         "  %s mcp [tools|help]                                        MCP stdio server\n"
         "  %s token | version | help\n",
-        p, p, p, p, p, p, p, p, p);
+        p, p, p, p, p, p, p, p, p, p);
 }
 
 static bool has_flag(int argc, char **argv, const char *flag) {
@@ -198,7 +200,49 @@ static int run_start(const char *prog, int argc, char **argv) {
         write_pidfile(getpid());
     }
 
-    ntc_err e = ntc_server_run(port, dash, tls_port);
+    ntc_err e = ntc_server_run(port, dash, tls_port, NULL);
+    unlink(pidfile_path());
+    if (e != NTC_OK) { NTC_ERROR("server exited: %s", ntc_err_str(e)); return 1; }
+    return 0;
+}
+
+/* `dev` runs the gateway in the foreground with mtime hot-reload: edit a
+ * controller, rebuild (manually or via --build), and the gateway respawns it. */
+static int run_dev(const char *prog, int argc, char **argv) {
+    if (argc < 3) { cli_errorf("'dev' needs a port, e.g. `%s dev 3000`", prog); return 2; }
+    uint16_t port = 0;
+    if (parse_port(argv[2], &port) != 0) { cli_errorf("invalid port '%s' (1-65535)", argv[2]); return 2; }
+
+    uint16_t dash = NTC_DASHBOARD_DEFAULT;
+    uint16_t tls_port = 0;
+    const char *build = NULL;
+    const char *paths[NTC_DEV_MAX_WATCH];
+    size_t npaths = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--no-dashboard") == 0) dash = 0;
+        else if ((strcmp(argv[i], "--dashboard") == 0 || strcmp(argv[i], "--admin") == 0) && i + 1 < argc) {
+            if (parse_port(argv[++i], &dash) != 0) { cli_errorf("invalid dashboard port '%s'", argv[i]); return 2; }
+        } else if (strcmp(argv[i], "--tls") == 0 && i + 1 < argc) {
+            if (parse_port(argv[++i], &tls_port) != 0) { cli_errorf("invalid TLS port '%s'", argv[i]); return 2; }
+        } else if (strcmp(argv[i], "--build") == 0 && i + 1 < argc) {
+            build = argv[++i];
+        } else if (strcmp(argv[i], "--watch") == 0 && i + 1 < argc) {
+            if (npaths >= NTC_DEV_MAX_WATCH) { cli_errorf("too many --watch paths (max %d)", NTC_DEV_MAX_WATCH); return 2; }
+            paths[npaths++] = argv[++i];
+        } else { cli_errorf("unknown argument '%s'", argv[i]); return 2; }
+    }
+    /* a build hook with no explicit --watch defaults to the usual source roots */
+    if (build && npaths == 0) {
+        if (access("controllers", F_OK) == 0) paths[npaths++] = "controllers";
+        if (access("src", F_OK) == 0) paths[npaths++] = "src";
+    }
+
+    int existing = read_pidfile();
+    if (pid_alive(existing)) { cli_errorf("already running (pid %d) - `%s stop` first", existing, prog); return 1; }
+    write_pidfile(getpid());
+
+    ntc_dev_opts opts = { .watch = true, .build_cmd = build, .paths = paths, .npaths = npaths };
+    ntc_err e = ntc_server_run(port, dash, tls_port, &opts);
     unlink(pidfile_path());
     if (e != NTC_OK) { NTC_ERROR("server exited: %s", ntc_err_str(e)); return 1; }
     return 0;
@@ -274,6 +318,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) { printf(NTC_NAME " %s\n", NTC_VERSION); return 0; }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) { usage(prog); return 0; }
     if (strcmp(cmd, "start") == 0) return run_start(prog, argc, argv);
+    if (strcmp(cmd, "dev") == 0) return run_dev(prog, argc, argv);
     if (strcmp(cmd, "stop") == 0) return cmd_stop();
     if (strcmp(cmd, "logs") == 0) return cmd_logs(argc, argv);
     if (strcmp(cmd, "status") == 0) return cmd_status(argc, argv);

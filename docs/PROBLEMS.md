@@ -19,3 +19,12 @@ Wave-3 deep live test).
   (`third_party/ca/roots.pem`) is whatever is vendored there; refreshing it from
   the upstream Mozilla/curl bundle is an ops task, and install-path resolution
   (vs. cwd-relative) is future work.
+
+## M10 — `ntc dev` (watch + hot-reload)
+
+- **The `--build` command runs synchronously on the event loop** (via
+  `system()`), so the gateway briefly stops serving while a rebuild compiles.
+  Acceptable for a local dev tool, but a production-grade version would run the
+  build off the loop (worker thread / child + non-blocking wait). mtime polling
+  (400ms) is also a deliberate simplification vs. native fs-events
+  (kqueue EVFILT_VNODE / inotify).

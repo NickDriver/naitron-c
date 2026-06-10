@@ -20,6 +20,7 @@ CLI and a built-in MCP server; observability via a read-only dashboard.
 
 ```sh
 ntc start 3000                              # run the gateway/core (the daemon)
+ntc dev 3000 --build "make controllers"     # foreground + hot-reload on rebuild
 ntc status                                  # core status
 ntc service add hello ./build/hello_controller   # register + spawn (live)
 ntc route add GET /api/hello hello          # route to a service (live)
@@ -33,11 +34,16 @@ ntc mcp                                      # built-in MCP server (stdio) for A
 ### Auth & TLS config
 
 ```sh
-# RS256 JWT: verify against a static JWKS/JWK public-key document
+# JWT (RS256/ES256): verify against a static JWKS/JWK public-key document
 ntc config set auth.mode jwt
 ntc config set auth.jwks_file ./jwks.json          # or NTC_AUTH_JWKS_FILE
 ntc config set auth.protect /api/                  # prefix to protect ("" = all)
 # (HS256 still works via auth.secret; the token's own `alg` selects the path.)
+
+# ...or fetch keys live from an IdP over HTTPS (Auth0/Okta/Cognito/Google):
+ntc config set auth.jwks_url https://issuer/.well-known/jwks.json  # NTC_AUTH_JWKS_URL
+ntc config set auth.jwks_ca ./roots.pem            # CA roots ("" = bundled); NTC_AUTH_JWKS_CA
+# keys are cached by `kid`; an unknown kid triggers a rate-limited refresh.
 
 # TLS termination (PEM cert chain + RSA private key)
 ntc config set tls.cert ./cert.pem                 # or NTC_TLS_CERT

@@ -1,7 +1,8 @@
 # naitron-c — v3 Spec (post-M7 roadmap: M8–M14)
 
-Status: **agreed 2026-06-09**, implementation in progress (**M8 + M9 shipped**;
-next: M10 `ntc dev`, then the dogfood checkpoint). Working spec for the
+Status: **agreed 2026-06-09**, implementation in progress (**Wave 1 feature
+phases done: M8 + M9 + M10**; next: the ★ dogfood checkpoint, then Wave 2).
+Working spec for the
 phases after M1–M7 (which shipped: gateway, process-per-service IPC wire v2,
 middleware, auth API-key/HS256/**RS256+TLS** via BearSSL, multi-language SDKs,
 static files, auto-OpenAPI). See `docs/SPEC.md` for the v2 spec, `docs/DECISIONS.md`

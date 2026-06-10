@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -125,6 +126,7 @@ typedef struct service {
     long restart_at;     /* monotonic ms; when to (re)spawn */
     long spawned_at;     /* monotonic ms; current process start */
     int backoff_ms;
+    long long bin_mtime; /* dev mode: last-seen mtime of `bin` (0 = unseen) */
     struct gateway *gw;
 } service;
 
@@ -164,6 +166,13 @@ typedef struct gateway {
     uint32_t gen[NTC_MAX_INFLIGHT];
     uint16_t free_slots[NTC_MAX_INFLIGHT];
     size_t free_top;
+    /* dev mode (ntc dev): mtime watch + hot reload */
+    bool dev_watch;
+    const char *dev_build;                       /* build command, or NULL */
+    const char *dev_paths[NTC_DEV_MAX_WATCH];    /* watched source files/dirs */
+    long long dev_path_mtime[NTC_DEV_MAX_WATCH]; /* last-seen max mtime (0=unseen) */
+    size_t dev_npaths;
+    long dev_last_poll_ms;
 } gateway;
 
 /* ---- forward declarations ---- */
@@ -1138,6 +1147,111 @@ static int spawn_service(gateway *g, service *svc) {
     return 0;
 }
 
+/* ---- dev mode: mtime watch + hot reload ---- */
+
+#define NTC_DEV_POLL_MS 400
+
+static long long stat_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (long long)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+#else
+    return (long long)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+#endif
+}
+
+static long long path_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return stat_mtime_ns(&st);
+}
+
+/* Greatest mtime among regular files under `path` (recursively), or the file's
+ * own mtime if `path` is a file. Skips dotfiles and noisy build dirs so an
+ * editor's churn in .git/build doesn't trip the watcher. Returns -1 if absent. */
+static long long tree_max_mtime(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (S_ISREG(st.st_mode)) return stat_mtime_ns(&st);
+    if (!S_ISDIR(st.st_mode)) return -1;
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    long long mx = -1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue; /* skip ., .., dotfiles (.git) */
+        if (strcmp(e->d_name, "build") == 0 || strcmp(e->d_name, "node_modules") == 0) continue;
+        char child[1024];
+        if ((size_t)snprintf(child, sizeof child, "%s/%s", path, e->d_name) >= sizeof child) continue;
+        long long m = tree_max_mtime(child);
+        if (m > mx) mx = m;
+    }
+    closedir(d);
+    return mx;
+}
+
+/* Tear down a service's current process and schedule an immediate respawn. Unlike
+ * controller_died this is intentional, so it neither logs an error nor applies
+ * backoff; in-flight requests on the old process are failed (502 / truncate). */
+static void dev_reload_service(gateway *g, service *svc) {
+    if (svc->conn) {
+        ctrl *ct = svc->conn;
+        (void)ntc_poller_del(g->p, ct->fd);
+        close(ct->fd);
+        kill(ct->pid, SIGTERM);
+        waitpid(ct->pid, NULL, 0);
+        for (uint32_t i = 0; i < NTC_MAX_INFLIGHT; i++) {
+            conn *c = g->pending[i];
+            if (!c || c->wait_ctrl != ct) continue;
+            gw_free_slot(g, (uint16_t)i);
+            c->inflight = false;
+            if (c->stream_head_sent) conn_close(g, c);
+            else (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"reloading\"}"));
+        }
+        free(ct->rbuf); free(ct->wbuf); free(ct);
+        svc->conn = NULL;
+    }
+    svc->backoff_ms = 0;
+    svc->restart_at = now_ms(); /* supervise() respawns on the next tick */
+}
+
+/* Poll watched paths + controller binaries; rebuild and/or reload on change.
+ * Self-throttled to NTC_DEV_POLL_MS so it can be called every loop iteration. */
+static void dev_tick(gateway *g) {
+    if (!g->dev_watch) return;
+    long now = now_ms();
+    if (g->dev_last_poll_ms && now - g->dev_last_poll_ms < NTC_DEV_POLL_MS) return;
+    g->dev_last_poll_ms = now;
+
+    /* 1. source watch -> optional build hook */
+    bool changed = false;
+    for (size_t i = 0; i < g->dev_npaths; i++) {
+        long long m = tree_max_mtime(g->dev_paths[i]);
+        if (m < 0) continue;
+        if (g->dev_path_mtime[i] == 0) { g->dev_path_mtime[i] = m; continue; } /* first scan */
+        if (m > g->dev_path_mtime[i]) { g->dev_path_mtime[i] = m; changed = true; }
+    }
+    if (changed && g->dev_build) {
+        NTC_INFO("dev: source changed -> %s", g->dev_build);
+        int rc = system(g->dev_build);
+        if (rc != 0) NTC_WARN("dev: build exited %d (keeping current binaries)", rc);
+        else NTC_SUCCESS("dev: build ok");
+    }
+
+    /* 2. binary watch -> reload the affected service (covers manual rebuilds too) */
+    for (size_t i = 0; i < g->nservices; i++) {
+        service *svc = &g->services[i];
+        if (svc->disabled) continue;
+        long long m = path_mtime_ns(svc->bin);
+        if (m < 0) continue;
+        if (svc->bin_mtime == 0) { svc->bin_mtime = m; continue; } /* first scan */
+        if (m != svc->bin_mtime) {
+            svc->bin_mtime = m;
+            NTC_SUCCESS("dev: '%s' binary changed -> reloading", svc->name);
+            dev_reload_service(g, svc);
+        }
+    }
+}
+
 static void supervise(gateway *g) {
     long t = now_ms();
     for (size_t i = 0; i < g->nservices; i++) {
@@ -1173,6 +1287,7 @@ static int poll_timeout(gateway *g) {
             if (d < to) to = (int)d;
         }
     }
+    if (g->dev_watch && to > NTC_DEV_POLL_MS) to = NTC_DEV_POLL_MS; /* wake to poll mtimes */
     return to;
 }
 
@@ -1443,12 +1558,19 @@ static void accept_control(gateway *g) {
     }
 }
 
-ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
+ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
+                       const ntc_dev_opts *dev) {
     gateway g;
     memset(&g, 0, sizeof g);
     gw_slots_init(&g);
     g.tls_fd = -1;
     g.m.start_ms = now_ms();
+    if (dev && dev->watch) {
+        g.dev_watch = true;
+        g.dev_build = dev->build_cmd;
+        for (size_t i = 0; i < dev->npaths && g.dev_npaths < NTC_DEV_MAX_WATCH; i++)
+            g.dev_paths[g.dev_npaths++] = dev->paths[i];
+    }
 
     if (ntc_router_create(&g.router) != NTC_OK) return NTC_ERR_OOM;
     if (ntc_builtin_register(g.router) != NTC_OK) { ntc_router_destroy(g.router); return NTC_ERR_INTERNAL; }
@@ -1616,12 +1738,17 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
     NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, %zu services, control %s)",
                 (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router), g.nservices,
                 g.control_fd >= 0 ? csock : "off");
+    if (g.dev_watch) {
+        NTC_INFO("dev: hot-reload on (poll %dms); watching %zu source path(s)%s%s",
+                 NTC_DEV_POLL_MS, g.dev_npaths, g.dev_build ? ", build: " : "",
+                 g.dev_build ? g.dev_build : "");
+    }
 
     ntc_poll_event evs[NTC_MAX_EVENTS];
     while (!g_stop) {
         int n = ntc_poller_wait(g.p, evs, NTC_MAX_EVENTS, poll_timeout(&g));
         if (n < 0) {
-            if (errno == EINTR) { supervise(&g); continue; }
+            if (errno == EINTR) { dev_tick(&g); supervise(&g); continue; }
             NTC_ERROR("poller_wait(): %s", strerror(errno));
             break;
         }
@@ -1654,6 +1781,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
                 if (evs[i].events & NTC_POLL_WRITE) (void)on_writable(&g, c);
             }
         }
+        dev_tick(&g);
         supervise(&g);
     }
 
@@ -1692,6 +1820,35 @@ fail_pre_poll:
 #ifdef UNIT_TEST
 #include "ntc/test.h"
 #include <sys/socket.h>
+
+TEST(dev, mtime_helpers) {
+    const char *dir = "/tmp/ntc_dev_mt_test";
+    mkdir(dir, 0755);
+    char fa[256], fb[256];
+    snprintf(fa, sizeof fa, "%s/a.c", dir);
+    snprintf(fb, sizeof fb, "%s/b.c", dir);
+    FILE *f = fopen(fa, "w"); ASSERT_NOT_NULL(f); fputs("a", f); fclose(f);
+    f = fopen(fb, "w"); ASSERT_NOT_NULL(f); fputs("b", f); fclose(f);
+
+    /* set explicit mtimes so the test is deterministic (no sleeps) */
+    struct timespec ta[2] = { { 1000, 0 }, { 1000, 0 } };
+    struct timespec tb[2] = { { 2000, 0 }, { 2000, 0 } };
+    ASSERT_EQ_INT(0, utimensat(AT_FDCWD, fa, ta, 0));
+    ASSERT_EQ_INT(0, utimensat(AT_FDCWD, fb, tb, 0));
+
+    ASSERT_TRUE(path_mtime_ns(fa) == 1000000000000LL);
+    ASSERT_TRUE(path_mtime_ns(fb) == 2000000000000LL);
+    ASSERT_TRUE(tree_max_mtime(dir) == 2000000000000LL); /* max over the tree */
+
+    /* bump a.c to be the newest -> tree max follows it */
+    struct timespec tc[2] = { { 3000, 0 }, { 3000, 0 } };
+    ASSERT_EQ_INT(0, utimensat(AT_FDCWD, fa, tc, 0));
+    ASSERT_TRUE(tree_max_mtime(dir) == 3000000000000LL);
+
+    ASSERT_TRUE(path_mtime_ns("/tmp/ntc_dev_mt_test/nope") == -1);
+
+    unlink(fa); unlink(fb); rmdir(dir);
+}
 
 TEST(poller, detects_readable_with_udata) {
     ntc_poller *p = NULL;
