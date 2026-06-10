@@ -33,7 +33,8 @@ offset size field
 ```
 
 Message types: `1 HELLO`, `2 WELCOME`, `3 REQUEST`, `4 RESPONSE`, `5 PING`,
-`6 PONG`, `7 RESPONSE_BEGIN`, `8 RESPONSE_CHUNK`, `9 RESPONSE_END` (7–9 = v3 streaming).
+`6 PONG`, `7 RESPONSE_BEGIN`, `8 RESPONSE_CHUNK`, `9 RESPONSE_END` (7–9 = v3
+streaming), `10 WS_OPEN`, `11 WS_MSG`, `12 WS_CLOSE` (10–12 = v3 WebSockets).
 
 ## Handshake
 
@@ -92,10 +93,32 @@ Backpressure: the gateway never throttles the (shared, multiplexed) controller
 socket for one slow client; if a client's unsent buffer exceeds the cap it is
 disconnected and its remaining chunks are dropped.
 
+## WebSockets (v3)
+
+The gateway terminates the WebSocket protocol (the `Upgrade` handshake with the
+SHA-1 `Sec-WebSocket-Accept`, client→server unmasking, and frame (de)coding);
+the controller only exchanges decoded messages. All frames share the WS
+connection's `request_id` (one inflight slot, held BEGIN-to-close like a stream).
+
+- **WS_OPEN** (core → controller): a WebSocket was accepted on a routed path. The
+  payload is a **REQUEST payload** (same layout), so the controller learns the
+  path/query/headers and the authenticated `auth_sub`/`auth_scope`.
+- **WS_MSG** (both directions): one message. Payload: `u8 opcode` (1 = text,
+  2 = binary) + `u32 len + bytes`. The gateway frames outbound messages and
+  unmasks inbound ones; `ping`/`pong` and `close` control frames are handled by
+  the gateway (a client `ping` is answered with a `pong`).
+- **WS_CLOSE** (both directions): close the WebSocket. Payload: `u16 code`
+  (0 = none). The gateway also emits this to the controller when the client
+  disconnects, so the controller's close handler always runs.
+
+Backpressure and the inflight-slot lifetime match streaming. wss (WebSocket over
+TLS) is not yet wired (a WS upgrade on a TLS connection is rejected).
+
 ## PING / PONG
 
 `PING` (core → controller) with empty payload; controller replies `PONG` with
-the same `request_id`. (Liveness; optional.)
+the same `request_id`. (Liveness; optional.) Distinct from WebSocket ping/pong,
+which never reach the controller.
 
 ## Limits
 

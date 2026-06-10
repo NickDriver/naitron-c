@@ -24,12 +24,27 @@ typedef struct ntc_stream ntc_stream;
 typedef int (*ntc_stream_fn)(const ntc_request *req, ntc_stream *st,
                              ntc_arena *a, void *udata);
 
+/* A live WebSocket connection (opaque). The gateway terminates the WS protocol;
+ * the controller exchanges decoded messages via these callbacks + ntc_ws_*. */
+typedef struct ntc_ws ntc_ws;
+typedef void (*ntc_ws_open_fn)(const ntc_request *req, ntc_ws *ws, void *udata);
+typedef void (*ntc_ws_msg_fn)(ntc_ws *ws, int opcode, const void *data,
+                              size_t len, void *udata);
+typedef void (*ntc_ws_close_fn)(ntc_ws *ws, void *udata);
+
 typedef struct ntc_controller {
     const char *name;
     ntc_controller_fn handle; /* atomic handler (one-shot response)      */
     ntc_stream_fn stream;     /* streaming handler (optional; if set, takes priority) */
+    ntc_ws_open_fn ws_open;       /* WebSocket opened (optional)         */
+    ntc_ws_msg_fn ws_message;     /* WebSocket message received          */
+    ntc_ws_close_fn ws_close;     /* WebSocket closed                    */
     void *udata;
 } ntc_controller;
+
+/* WS message opcodes for ntc_ws_send (text is UTF-8, binary is opaque). */
+#define NTC_WS_OP_TEXT   1
+#define NTC_WS_OP_BINARY 2
 
 /* Run the serve loop on the inherited socket (fd in $NTC_CONTROLLER_FD).
  * Blocks until the core closes the connection; returns a process exit code. */
@@ -48,5 +63,12 @@ int ntc_sse_begin(ntc_stream *st);                                        /* Con
 int ntc_stream_write(ntc_stream *st, const void *data, size_t len);       /* one body chunk */
 int ntc_sse_send(ntc_stream *st, const char *event, const char *data);    /* one SSE event (event optional) */
 int ntc_stream_end(ntc_stream *st);
+
+/* ---- WebSocket API (used from the ws_open / ws_message / ws_close callbacks) ----
+ * Send a message to the peer (opcode = NTC_WS_OP_TEXT/BINARY), or close the
+ * socket. Each returns 0 on success, -1 on a write error. */
+int ntc_ws_send(ntc_ws *ws, int opcode, const void *data, size_t len);
+int ntc_ws_send_text(ntc_ws *ws, const char *text);
+int ntc_ws_close(ntc_ws *ws);
 
 #endif /* NTC_CONTROLLER_H */

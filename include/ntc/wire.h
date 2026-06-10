@@ -32,7 +32,10 @@ typedef enum ntc_msg_type {
     NTC_MSG_PONG           = 6,
     NTC_MSG_RESPONSE_BEGIN = 7, /* controller -> core: start of a stream (status+flags+ctype) */
     NTC_MSG_RESPONSE_CHUNK = 8, /* controller -> core: a body chunk           */
-    NTC_MSG_RESPONSE_END   = 9  /* controller -> core: stream complete (empty payload) */
+    NTC_MSG_RESPONSE_END   = 9, /* controller -> core: stream complete (empty payload) */
+    NTC_MSG_WS_OPEN        = 10,/* core -> controller: a WebSocket opened (REQUEST payload) */
+    NTC_MSG_WS_MSG         = 11,/* both ways: one WS message (opcode + data)  */
+    NTC_MSG_WS_CLOSE       = 12 /* both ways: close the WebSocket (u16 code)   */
 } ntc_msg_type;
 
 /* RESPONSE_BEGIN flags: how the gateway frames the stream to the HTTP client. */
@@ -76,5 +79,13 @@ bool ntc_wire_decode_response_begin(const uint8_t *buf, size_t len, int *status,
                                     uint8_t *flags, ntc_slice *ctype);
 ssize_t ntc_wire_encode_chunk(ntc_slice data, uint8_t *out, size_t cap);
 bool ntc_wire_decode_chunk(const uint8_t *buf, size_t len, ntc_slice *data);
+
+/* WebSocket (v3). WS_OPEN carries a REQUEST payload (encode/decode_request).
+ * WS_MSG is bidirectional: a u8 opcode (1=text, 2=binary) + a u32-prefixed data
+ * slice. WS_CLOSE is bidirectional: a u16 status code (0 = none). */
+ssize_t ntc_wire_encode_ws_msg(uint8_t opcode, ntc_slice data, uint8_t *out, size_t cap);
+bool ntc_wire_decode_ws_msg(const uint8_t *buf, size_t len, uint8_t *opcode, ntc_slice *data);
+ssize_t ntc_wire_encode_ws_close(uint16_t code, uint8_t *out, size_t cap);
+bool ntc_wire_decode_ws_close(const uint8_t *buf, size_t len, uint16_t *code);
 
 #endif /* NTC_WIRE_H */

@@ -15,6 +15,7 @@
 #include "ntc/tls.h"
 #include "ntc/version.h"
 #include "ntc/wire.h"
+#include "ntc/ws.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -53,7 +54,7 @@
 #define JSON NTC_SLICE_LIT("application/json")
 
 enum { KIND_HTTP = 1, KIND_CTRL = 2, KIND_CONTROL = 3 };
-enum { CS_READ, CS_WAIT, CS_WRITE, CS_STREAM };
+enum { CS_READ, CS_WAIT, CS_WRITE, CS_STREAM, CS_WS };
 
 /* cap on a single client's buffered-but-unsent streamed bytes; past this the
  * client can't keep up and is disconnected (never throttle the shared
@@ -102,6 +103,7 @@ typedef struct conn {
     bool stream_sse;      /* true=SSE raw passthrough, false=chunked framing */
     bool stream_head_sent;/* the response head has been queued */
     bool stream_ended;    /* RESPONSE_END seen; close once swbuf drains */
+    bool is_ws;           /* upgraded to a WebSocket (CS_WS); reuses swbuf out */
     uint8_t *swbuf;
     size_t swlen, swsent, swcap;
     char rbuf[NTC_CONN_RBUF];
@@ -186,6 +188,9 @@ static void on_tls_event(gateway *g, conn *c);
 static void controller_died(gateway *g, ctrl *ct);
 static int  spawn_service(gateway *g, service *svc);
 static void exec_control_command(gateway *g, char *cmdline, char *out, size_t cap);
+static int  ctrl_queue(ctrl *ct, uint8_t type, uint32_t rid, const uint8_t *payload, uint32_t plen);
+static int  ctrl_update_poll(gateway *g, ctrl *ct);
+static int  on_ws_readable(gateway *g, conn *c);
 
 /* ---- utilities ---- */
 static int set_nonblocking(int fd) {
@@ -255,6 +260,14 @@ static conn *conn_new(gateway *g, int fd) {
 }
 
 static void conn_close(gateway *g, conn *c) {
+    /* a WebSocket torn down (client EOF/error) -> tell the controller so its
+     * ws_close fires. Done before freeing the slot, while it is still valid. */
+    if (c->is_ws && c->inflight && c->wait_ctrl) {
+        uint8_t cb[2];
+        ssize_t pl = ntc_wire_encode_ws_close(1000, cb, sizeof cb);
+        if (pl > 0 && ctrl_queue(c->wait_ctrl, NTC_MSG_WS_CLOSE, c->req_id, cb, (uint32_t)pl) == 0)
+            (void)ctrl_update_poll(g, c->wait_ctrl);
+    }
     if (c->inflight) { gw_free_slot(g, (uint16_t)(c->req_id & NTC_INFLIGHT_MASK)); c->inflight = false; }
     (void)ntc_poller_del(g->p, c->fd);
     close(c->fd);
@@ -457,6 +470,136 @@ static void gw_deliver_end(gateway *g, uint32_t id) {
     (void)stream_push(g, c, NULL, 0); /* SSE: kick a final drain; on_writable closes when empty */
 }
 
+/* ---- WebSockets (relay between client frames and controller WS_MSG) ---- */
+
+/* controller -> client: encode a WS message and push it to the socket. */
+static void gw_ws_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t len) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c || !c->is_ws) return;
+    uint8_t opcode; ntc_slice data;
+    if (!ntc_wire_decode_ws_msg(payload, len, &opcode, &data)) return;
+    /* WS_MSG opcode convention 1=text/2=binary == ntc_ws_opcode NTC_WS_TEXT/BIN */
+    ntc_ws_opcode wsop = (opcode == (uint8_t)NTC_WS_BIN) ? NTC_WS_BIN : NTC_WS_TEXT;
+    size_t cap = data.len + 16;
+    uint8_t *frame = malloc(cap);
+    if (!frame) return;
+    ssize_t fn = ntc_ws_encode(wsop, (const uint8_t *)data.ptr, data.len, frame, cap);
+    if (fn > 0) (void)stream_push(g, c, frame, (size_t)fn);
+    free(frame);
+}
+
+/* controller -> client: close the WebSocket (send a close frame, then close). */
+static void gw_ws_deliver_close(gateway *g, uint32_t id) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c) return;
+    gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK)); /* controller initiated; no notify-back */
+    c->inflight = false;
+    uint8_t cf[4];
+    ssize_t cn = ntc_ws_encode(NTC_WS_CLOSE, NULL, 0, cf, sizeof cf);
+    if (cn > 0) {
+        c->stream_ended = true; /* on_writable closes once the close frame drains */
+        (void)stream_push(g, c, cf, (size_t)cn);
+    } else {
+        conn_close(g, c);
+    }
+}
+
+/* client -> controller: read available bytes, decode complete frames, and relay
+ * data messages to the controller (ping/close handled here). <0 if conn closed. */
+static int on_ws_readable(gateway *g, conn *c) {
+    for (;;) {
+        if (c->rlen == NTC_CONN_RBUF) { conn_close(g, c); return -1; } /* frame too big to buffer */
+        ssize_t n = recv(c->fd, c->rbuf + c->rlen, NTC_CONN_RBUF - c->rlen, 0);
+        if (n > 0) { c->rlen += (size_t)n; continue; }
+        if (n == 0) { conn_close(g, c); return -1; } /* client EOF */
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        conn_close(g, c);
+        return -1;
+    }
+
+    size_t off = 0;
+    while (off < c->rlen) {
+        size_t consumed = 0, paylen = 0;
+        ntc_ws_opcode op; bool fin; uint8_t *pay;
+        int r = ntc_ws_decode((uint8_t *)c->rbuf + off, c->rlen - off, &consumed, &op, &fin, &pay, &paylen);
+        if (r == 0) break;                       /* need more bytes */
+        if (r < 0) { conn_close(g, c); return -1; } /* protocol error */
+
+        if (op == NTC_WS_CLOSE) {
+            conn_close(g, c); /* notifies the controller via the is_ws path */
+            return -1;
+        } else if (op == NTC_WS_PING) {
+            uint8_t pong[160];
+            size_t pl = paylen > 125 ? 0 : paylen; /* control frames are <=125 */
+            ssize_t pn = ntc_ws_encode(NTC_WS_PONG, pay, pl, pong, sizeof pong);
+            if (pn > 0 && stream_push(g, c, pong, (size_t)pn) < 0) return -1;
+        } else if (op == NTC_WS_PONG) {
+            /* ignore */
+        } else if (c->wait_ctrl && c->inflight) { /* TEXT / BINARY / CONT -> controller */
+            uint8_t opcode = (op == NTC_WS_BIN) ? (uint8_t)NTC_WS_BIN : (uint8_t)NTC_WS_TEXT;
+            size_t cap = paylen + 16;
+            uint8_t *enc = malloc(cap);
+            if (enc) {
+                ssize_t pn = ntc_wire_encode_ws_msg(opcode, ntc_slice_new((const char *)pay, paylen), enc, cap);
+                if (pn > 0 && ctrl_queue(c->wait_ctrl, NTC_MSG_WS_MSG, c->req_id, enc, (uint32_t)pn) == 0)
+                    (void)ctrl_update_poll(g, c->wait_ctrl);
+                free(enc);
+            }
+        }
+        off += consumed;
+    }
+    if (off > 0) { memmove(c->rbuf, c->rbuf + off, c->rlen - off); c->rlen -= off; }
+    return 0;
+}
+
+/* Perform the WebSocket upgrade handshake and wire the conn to the controller. */
+static int gw_ws_upgrade(gateway *g, conn *c, const ntc_request *req, service *svc) {
+    if (c->tls) /* wss (WS over TLS) inbound framing is not wired yet (see PROBLEMS.md) */
+        return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"wss not supported yet\"}"));
+    if (svc->disabled || !svc->conn)
+        return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"service unavailable\"}"));
+    ntc_slice key = ntc_http_header(req, "sec-websocket-key");
+    if (key.len == 0 || key.len > 64)
+        return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"missing Sec-WebSocket-Key\"}"));
+    char accept[40];
+    ntc_ws_accept_key(key.ptr, key.len, accept, sizeof accept);
+
+    uint8_t *enc = malloc(NTC_CONN_RBUF + 1024);
+    if (!enc) return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"oom\"}"));
+    ssize_t pl = ntc_wire_encode_request(req, enc, NTC_CONN_RBUF + 1024);
+    if (pl < 0) { free(enc); return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"encode failed\"}")); }
+    uint32_t id;
+    if (gw_alloc_id(g, c, &id) != 0) { free(enc); return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"too many in-flight\"}")); }
+    if (ctrl_queue(svc->conn, NTC_MSG_WS_OPEN, id, enc, (uint32_t)pl) != 0) {
+        free(enc); gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
+        return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"queue full\"}"));
+    }
+    free(enc);
+    (void)ctrl_update_poll(g, svc->conn);
+
+    c->req_id = id;
+    c->inflight = true;
+    c->wait_ctrl = svc->conn;
+    c->is_ws = true;
+    c->streaming = true;       /* reuse the swbuf outbound-drain machinery */
+    c->stream_head_sent = true;
+    c->state = CS_WS;
+    c->rlen = 0;               /* the HTTP request is consumed; rbuf now holds WS frames */
+    if (!c->is_admin && !c->logged && g->mw) {
+        ntc_mw_after(g->mw, c->log_method, c->log_path, c->request_id, 101, now_ms() - c->req_start);
+        c->logged = true;
+    }
+
+    char head[256];
+    int hn = snprintf(head, sizeof head,
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n", accept);
+    if (hn < 0) { conn_close(g, c); return -1; }
+    return stream_push(g, c, head, (size_t)hn);
+}
+
 static void controller_died(gateway *g, ctrl *ct) {
     service *svc = ct->svc;
     NTC_ERROR("controller '%s' (pid %ld) died", svc ? svc->name : "?", (long)ct->pid);
@@ -528,6 +671,8 @@ static int on_ctrl_readable(gateway *g, ctrl *ct) {
             case NTC_MSG_RESPONSE_BEGIN: gw_deliver_begin(g, h.request_id, pl, h.length); break;
             case NTC_MSG_RESPONSE_CHUNK: gw_deliver_chunk(g, h.request_id, pl, h.length); break;
             case NTC_MSG_RESPONSE_END:   gw_deliver_end(g, h.request_id); break;
+            case NTC_MSG_WS_MSG:         gw_ws_deliver(g, h.request_id, pl, h.length); break;
+            case NTC_MSG_WS_CLOSE:       gw_ws_deliver_close(g, h.request_id); break;
             default: break;
         }
         off += consumed;
@@ -706,6 +851,9 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
         }
         fr.auth_sub = ntc_slice_cstr(c->auth_sub);
         fr.auth_scope = ntc_slice_cstr(c->auth_scope);
+        /* a WebSocket upgrade request takes the WS path instead of HTTP forward */
+        if (ntc_slice_eq_cstr(ntc_http_header(&fr, "upgrade"), "websocket"))
+            return gw_ws_upgrade(g, c, &fr, (service *)udata);
         return gw_forward(g, c, &fr, (service *)udata);
     }
 
@@ -1792,6 +1940,9 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
             } else if (c->state == CS_STREAM) {
                 if ((evs[i].events & NTC_POLL_WRITE) && on_writable(&g, c) < 0) continue;
                 if (evs[i].events & NTC_POLL_READ) on_wait_readable(&g, c); /* detect client EOF */
+            } else if (c->state == CS_WS) {
+                if ((evs[i].events & NTC_POLL_WRITE) && on_writable(&g, c) < 0) continue;
+                if ((evs[i].events & NTC_POLL_READ) && on_ws_readable(&g, c) < 0) continue;
             } else {
                 if (evs[i].events & NTC_POLL_WRITE) (void)on_writable(&g, c);
             }

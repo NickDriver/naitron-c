@@ -46,14 +46,15 @@ COVBIN  := $(BUILD)/ntc_cov
 # Example out-of-process controllers (each its own binary; links the SDK + wire).
 HELLO_BIN := $(BUILD)/hello_controller
 SSE_BIN   := $(BUILD)/sse_controller
+WS_BIN    := $(BUILD)/ws_echo
 SDK_SRC   := src/common/controller_sdk.c src/common/wire.c src/common/arena.c \
              src/common/slice.c src/common/http_request.c
 
 .PHONY: all controllers test test-unit test-it test-list coverage run clean
 
-all: $(BIN) $(HELLO_BIN) $(SSE_BIN)
+all: $(BIN) $(HELLO_BIN) $(SSE_BIN) $(WS_BIN)
 
-controllers: $(HELLO_BIN) $(SSE_BIN)
+controllers: $(HELLO_BIN) $(SSE_BIN) $(WS_BIN)
 
 $(BIN): $(SRC_LIB) $(SRC_MAIN) $(BEARSSL_LIB) | $(BUILD)
 	$(CC) $(COMMON) $(BEARSSL_INC) $(REL_FLAGS) $(SRC_LIB) $(SRC_MAIN) $(BEARSSL_LIB) $(LDLIBS) -o $@
@@ -71,19 +72,23 @@ $(SSE_BIN): controllers/sse_controller.c $(SDK_SRC) | $(BUILD)
 	$(CC) $(COMMON) $(REL_FLAGS) controllers/sse_controller.c $(SDK_SRC) -o $@
 	@echo "built $@"
 
+$(WS_BIN): controllers/ws_echo.c $(SDK_SRC) | $(BUILD)
+	$(CC) $(COMMON) $(REL_FLAGS) controllers/ws_echo.c $(SDK_SRC) -o $@
+	@echo "built $@"
+
 # All objects are linked directly (no static archive) so the TEST()
 # constructors are never dropped by the linker.
 $(TESTBIN): $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(BEARSSL_LIB) | $(BUILD)
 	$(CC) $(COMMON) $(BEARSSL_INC) $(TEST_FLAGS) $(SRC_LIB) $(TESTS_INT) $(SRC_TEST) $(BEARSSL_LIB) $(LDLIBS) -o $@
 
 # integration tests spawn the release binaries, so build them first
-test: $(TESTBIN) $(BIN) $(HELLO_BIN) $(SSE_BIN)
+test: $(TESTBIN) $(BIN) $(HELLO_BIN) $(SSE_BIN) $(WS_BIN)
 	$(TEST_RUN) ./$(TESTBIN)
 
 test-unit: $(TESTBIN)
 	$(TEST_RUN) ./$(TESTBIN) unit
 
-test-it: $(TESTBIN) $(BIN) $(HELLO_BIN) $(SSE_BIN)
+test-it: $(TESTBIN) $(BIN) $(HELLO_BIN) $(SSE_BIN) $(WS_BIN)
 	$(TEST_RUN) ./$(TESTBIN) it
 
 test-list: $(TESTBIN)

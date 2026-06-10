@@ -1,8 +1,8 @@
 # naitron-c — v3 Spec (post-M7 roadmap: M8–M14)
 
-Status: **agreed 2026-06-09**, implementation in progress (**Wave 1 complete:
-M8 + M9 + M10 + the ★ dogfood checkpoint** — see `examples/ai-chat/` and its
-`DX_NOTES.md`; next: Wave 2, starting M11 WebSockets). Working spec for the
+Status: **agreed 2026-06-09**, implementation in progress (**Wave 1 complete**
++ **M11 WebSockets shipped**; next in Wave 2: M12 OAuth2 login, M13 schema
+validation, M14 production grab-bag). Working spec for the
 phases after M1–M7 (which shipped: gateway, process-per-service IPC wire v2,
 middleware, auth API-key/HS256/**RS256+TLS** via BearSSL, multi-language SDKs,
 static files, auto-OpenAPI). See `docs/SPEC.md` for the v2 spec, `docs/DECISIONS.md`

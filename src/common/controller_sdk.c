@@ -119,8 +119,34 @@ int ntc_stream_end(ntc_stream *st) {
     return send_frame(st->fd, NTC_MSG_RESPONSE_END, st->rid, NULL, 0);
 }
 
+/* ---- WebSocket API ---- */
+struct ntc_ws { int fd; uint32_t rid; };
+
+int ntc_ws_send(ntc_ws *ws, int opcode, const void *data, size_t len) {
+    if (len > 0xFFFFFFFFu - 16) return -1;
+    size_t cap = len + 8;
+    uint8_t *pl = malloc(cap);
+    if (!pl) return -1;
+    ssize_t pn = ntc_wire_encode_ws_msg((uint8_t)opcode, ntc_slice_new((const char *)data, len), pl, cap);
+    int rc = (pn > 0) ? send_frame(ws->fd, NTC_MSG_WS_MSG, ws->rid, pl, (uint32_t)pn) : -1;
+    free(pl);
+    return rc;
+}
+
+int ntc_ws_send_text(ntc_ws *ws, const char *text) {
+    return ntc_ws_send(ws, NTC_WS_OP_TEXT, text, text ? strlen(text) : 0);
+}
+
+int ntc_ws_close(ntc_ws *ws) {
+    uint8_t cb[2];
+    ssize_t pn = ntc_wire_encode_ws_close(1000, cb, sizeof cb);
+    if (pn < 0) return -1;
+    return send_frame(ws->fd, NTC_MSG_WS_CLOSE, ws->rid, cb, (uint32_t)pn);
+}
+
 int ntc_controller_run(const ntc_controller *ctl) {
-    if (!ctl || (!ctl->handle && !ctl->stream)) return 2;
+    if (!ctl || (!ctl->handle && !ctl->stream && !ctl->ws_open && !ctl->ws_message))
+        return 2;
 
     const char *fds = getenv("NTC_CONTROLLER_FD");
     if (!fds) { fprintf(stderr, "controller: NTC_CONTROLLER_FD not set\n"); return 2; }
@@ -148,6 +174,30 @@ int ntc_controller_run(const ntc_controller *ctl) {
 
         if (h.type == NTC_MSG_WELCOME) continue;
         if (h.type == NTC_MSG_PING) { (void)send_frame(fd, NTC_MSG_PONG, h.request_id, NULL, 0); continue; }
+
+        if (h.type == NTC_MSG_WS_OPEN) {
+            if (ctl->ws_open) {
+                ntc_ws ws = { fd, h.request_id };
+                ntc_request req;
+                if (ntc_wire_decode_request(payload, h.length, &req))
+                    ctl->ws_open(&req, &ws, ctl->udata);
+            }
+            continue;
+        }
+        if (h.type == NTC_MSG_WS_MSG) {
+            if (ctl->ws_message) {
+                ntc_ws ws = { fd, h.request_id };
+                uint8_t opcode; ntc_slice data;
+                if (ntc_wire_decode_ws_msg(payload, h.length, &opcode, &data))
+                    ctl->ws_message(&ws, opcode, data.ptr, data.len, ctl->udata);
+            }
+            continue;
+        }
+        if (h.type == NTC_MSG_WS_CLOSE) {
+            if (ctl->ws_close) { ntc_ws ws = { fd, h.request_id }; ctl->ws_close(&ws, ctl->udata); }
+            continue;
+        }
+
         if (h.type != NTC_MSG_REQUEST) continue;
 
         ntc_arena a;

@@ -28,3 +28,15 @@ Wave-3 deep live test).
   build off the loop (worker thread / child + non-blocking wait). mtime polling
   (400ms) is also a deliberate simplification vs. native fs-events
   (kqueue EVFILT_VNODE / inotify).
+
+## M11 — WebSockets
+
+- **wss (WebSocket over TLS) is not wired yet.** The plaintext path is complete
+  (handshake, masking, framing, bidirectional relay). A WS upgrade arriving on a
+  TLS connection is rejected with 400. The frame codec is transport-agnostic, so
+  wss only needs the inbound TLS read path (`on_tls_event`) to feed decrypted
+  bytes into `on_ws_readable` and the outbound to keep using the existing
+  `tls_drive_write` drain. Deferred to a TLS-WS follow-up.
+- **No fragmentation reassembly.** Each WS data frame is relayed as its own
+  message (CONT frames are forwarded but not coalesced). Fine for typical
+  clients that send unfragmented messages; revisit if a client fragments.

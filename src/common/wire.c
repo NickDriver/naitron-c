@@ -203,6 +203,33 @@ bool ntc_wire_decode_chunk(const uint8_t *buf, size_t len, ntc_slice *data) {
     return !r.err;
 }
 
+ssize_t ntc_wire_encode_ws_msg(uint8_t opcode, ntc_slice data, uint8_t *out, size_t cap) {
+    wbuf w = { out, cap, 0, false };
+    w_u8(&w, opcode);
+    w_u32(&w, (uint32_t)data.len);
+    w_bytes(&w, data.ptr, data.len);
+    return w.err ? -1 : (ssize_t)w.off;
+}
+
+bool ntc_wire_decode_ws_msg(const uint8_t *buf, size_t len, uint8_t *opcode, ntc_slice *data) {
+    rbuf r = { buf, len, 0, false };
+    *opcode = r_u8(&r);
+    *data = r_slice32(&r);
+    return !r.err;
+}
+
+ssize_t ntc_wire_encode_ws_close(uint16_t code, uint8_t *out, size_t cap) {
+    wbuf w = { out, cap, 0, false };
+    w_u16(&w, code);
+    return w.err ? -1 : (ssize_t)w.off;
+}
+
+bool ntc_wire_decode_ws_close(const uint8_t *buf, size_t len, uint16_t *code) {
+    rbuf r = { buf, len, 0, false };
+    *code = r_u16(&r);
+    return !r.err;
+}
+
 #ifdef UNIT_TEST
 #include "ntc/test.h"
 
@@ -284,6 +311,23 @@ TEST(wire, chunk_roundtrip) {
     ASSERT_TRUE(ntc_wire_decode_chunk(enc, (size_t)n, &data));
     ASSERT_EQ_UINT((unsigned)sizeof raw, (unsigned)data.len);
     ASSERT_TRUE(memcmp(data.ptr, raw, sizeof raw) == 0);
+}
+
+TEST(wire, ws_msg_roundtrip) {
+    uint8_t enc[64];
+    ssize_t n = ntc_wire_encode_ws_msg(1, ntc_slice_new("ping", 4), enc, sizeof enc);
+    ASSERT_TRUE(n > 0);
+    uint8_t op; ntc_slice data;
+    ASSERT_TRUE(ntc_wire_decode_ws_msg(enc, (size_t)n, &op, &data));
+    ASSERT_EQ_INT(1, (int)op);
+    ASSERT_EQ_UINT(4u, (unsigned)data.len);
+    ASSERT_TRUE(memcmp(data.ptr, "ping", 4) == 0);
+
+    uint16_t code = 0;
+    n = ntc_wire_encode_ws_close(1000, enc, sizeof enc);
+    ASSERT_TRUE(n > 0);
+    ASSERT_TRUE(ntc_wire_decode_ws_close(enc, (size_t)n, &code));
+    ASSERT_EQ_INT(1000, (int)code);
 }
 
 TEST(wire, version_range_accept) {
