@@ -1,14 +1,21 @@
-"""naitron-c controller SDK (Python). Implements the v2 IPC wire protocol.
+"""naitron-c controller SDK (Python). Implements the IPC wire protocol (v2 +
+v3 streaming).
 
-A controller defines a handler(req) -> (status, content_type, body) and calls
-naitron.run(handler, name). See docs/WIRE_PROTOCOL.md.
+Atomic controllers define handler(req) -> (status, content_type, body) and call
+naitron.run(handler, name).
+
+Streaming controllers define handler(req, stream) -> None, drive the `stream`
+(sse_begin/sse_send or begin/write, then it auto-ends), and call
+naitron.run(handler, name, stream=True). See docs/WIRE_PROTOCOL.md.
 """
 import os
 import struct
 
 MAGIC = 0x4E544331
-VERSION = 2
+VERSION = 2  # written version stays 2; v3 adds new message TYPES (7-9)
 HELLO, WELCOME, REQUEST, RESPONSE, PING, PONG = 1, 2, 3, 4, 5, 6
+RESPONSE_BEGIN, RESPONSE_CHUNK, RESPONSE_END = 7, 8, 9
+STREAM_FLAG_SSE, STREAM_FLAG_CHUNKED = 0x01, 0x02
 
 
 def _read_exact(fd, n):
@@ -31,6 +38,11 @@ def _send_frame(fd, typ, rid, payload=b""):
     _write_all(fd, struct.pack(">IBBHII", MAGIC, VERSION, typ, 0, rid, len(payload)))
     if payload:
         _write_all(fd, payload)
+
+
+def _slice16(s):
+    b = s.encode() if isinstance(s, str) else s
+    return struct.pack(">H", len(b)) + b
 
 
 def _rd_slice16(buf, off):
@@ -74,7 +86,51 @@ def _encode_response(status, content_type, body):
     return struct.pack(">HH", status, len(ct)) + ct + struct.pack(">I", len(body)) + body
 
 
-def run(handler, name="controller"):
+class Stream:
+    """A live streaming response. Use sse_begin()/sse_send() for Server-Sent
+    Events, or begin()/write() for generic Transfer-Encoding: chunked. The SDK
+    auto-emits RESPONSE_END once the handler returns."""
+
+    def __init__(self, fd, rid):
+        self.fd = fd
+        self.rid = rid
+        self.begun = False
+        self.ended = False
+
+    def sse_begin(self, status=200):
+        if self.begun:
+            return
+        payload = struct.pack(">HB", status, STREAM_FLAG_SSE) + _slice16("text/event-stream")
+        _send_frame(self.fd, RESPONSE_BEGIN, self.rid, payload)
+        self.begun = True
+
+    def begin(self, status=200, content_type="application/octet-stream"):
+        if self.begun:
+            return
+        payload = struct.pack(">HB", status, STREAM_FLAG_CHUNKED) + _slice16(content_type)
+        _send_frame(self.fd, RESPONSE_BEGIN, self.rid, payload)
+        self.begun = True
+
+    def write(self, data):
+        if not self.begun:
+            self.begin()
+        if isinstance(data, str):
+            data = data.encode()
+        _send_frame(self.fd, RESPONSE_CHUNK, self.rid, struct.pack(">I", len(data)) + data)
+
+    def sse_send(self, event, data):
+        if not self.begun:
+            self.sse_begin()
+        self.write("event: %s\ndata: %s\n\n" % (event, data))
+
+    def end(self):
+        if self.ended:
+            return
+        _send_frame(self.fd, RESPONSE_END, self.rid, b"")
+        self.ended = True
+
+
+def run(handler, name="controller", stream=False):
     fd = int(os.environ["NTC_CONTROLLER_FD"])
     _send_frame(fd, HELLO, 0, name.encode())
     while True:
@@ -93,8 +149,22 @@ def run(handler, name="controller"):
         if typ != REQUEST:
             continue
         req = _decode_request(payload)
-        try:
-            status, ctype, body = handler(req)
-        except Exception:
-            status, ctype, body = 500, "application/json", '{"error":"controller error"}'
-        _send_frame(fd, RESPONSE, rid, _encode_response(status, ctype, body))
+        if stream:
+            st = Stream(fd, rid)
+            try:
+                handler(req, st)
+            except Exception:
+                if not st.begun:
+                    _send_frame(fd, RESPONSE, rid,
+                                _encode_response(500, "application/json",
+                                                 '{"error":"controller error"}'))
+                    continue
+            finally:
+                if st.begun and not st.ended:
+                    st.end()
+        else:
+            try:
+                status, ctype, body = handler(req)
+            except Exception:
+                status, ctype, body = 500, "application/json", '{"error":"controller error"}'
+            _send_frame(fd, RESPONSE, rid, _encode_response(status, ctype, body))

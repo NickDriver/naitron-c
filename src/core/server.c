@@ -1307,8 +1307,23 @@ static ntc_err load_registry(gateway *g) {
         const char *bin = getenv("NTC_CONTROLLER_BIN");
         if (bin) {
             if (ntc_registry_add_service(g->reg, "hello", bin) == NTC_OK) {
-                (void)ntc_registry_add_route(g->reg, "GET", "/api/hello", "hello");
-                (void)ntc_registry_add_route(g->reg, "GET", "/api/hello/:name", "hello");
+                /* NTC_CONTROLLER_ROUTE overrides the seeded route(s); accepts a
+                 * ';'-separated list of "METHOD /path" entries so a quickstart
+                 * controller can serve more than just GET /api/hello. */
+                const char *routes = getenv("NTC_CONTROLLER_ROUTE");
+                if (routes && *routes) {
+                    char list[1024];
+                    snprintf(list, sizeof list, "%s", routes);
+                    for (char *save = NULL, *tok = strtok_r(list, ";", &save);
+                         tok; tok = strtok_r(NULL, ";", &save)) {
+                        char method[8] = "GET", path[256] = "";
+                        if (sscanf(tok, "%7s %255s", method, path) >= 1 && path[0])
+                            (void)ntc_registry_add_route(g->reg, method, path, "hello");
+                    }
+                } else {
+                    (void)ntc_registry_add_route(g->reg, "GET", "/api/hello", "hello");
+                    (void)ntc_registry_add_route(g->reg, "GET", "/api/hello/:name", "hello");
+                }
                 NTC_TRY(ntc_registry_list_services(g->reg, srows, 64, &scount));
             }
         }

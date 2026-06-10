@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>naitron-c · streaming chat</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  .muted { color: #888; font-size: .85rem; }
+  #log { border: 1px solid #8884; border-radius: 8px; padding: 1rem; min-height: 8rem; white-space: pre-wrap; }
+  .row { display: flex; gap: .5rem; margin: .6rem 0; }
+  input, button { font: inherit; padding: .5rem .6rem; border-radius: 6px; border: 1px solid #8886; }
+  #msg { flex: 1; }
+  .you { color: #2a7; }
+  .err { color: #d44; }
+</style>
+</head>
+<body>
+  <h1>naitron-c — streaming chat</h1>
+  <p class="muted">SSE token streaming from a JWT-protected Python controller.
+     Mint a token with <code>python3 mint_token.py</code> and paste it below.</p>
+
+  <div class="row"><input id="token" placeholder="Bearer JWT (from mint_token.py)" /></div>
+  <div id="log"></div>
+  <div class="row">
+    <input id="msg" placeholder="Say something…" value="hello from the browser" />
+    <button id="send">Send</button>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+
+function line(text, cls) {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text;
+  log.appendChild(span);
+}
+
+// EventSource can't set an Authorization header, so we stream with fetch() and
+// parse the SSE frames ourselves. (A real DX gotcha — see DX_NOTES.md.)
+async function chat(message, token) {
+  log.textContent = "";
+  line("you: " + message + "\n", "you");
+  line("bot: ");
+  const res = await fetch("/api/chat?q=" + encodeURIComponent(message), {
+    headers: { Authorization: "Bearer " + token },
+  });
+  if (!res.ok) { line("\n[" + res.status + "] " + (await res.text()), "err"); return; }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+      let event = "message", data = "";
+      for (const l of frame.split("\n")) {
+        if (l.startsWith("event:")) event = l.slice(6).trim();
+        else if (l.startsWith("data:")) data += l.slice(5).trim();
+      }
+      if (event === "token") line(data);
+      else if (event === "done") line("\n", "muted");
+    }
+  }
+}
+
+$("send").onclick = () => {
+  const token = $("token").value.trim();
+  if (!token) { log.textContent = "paste a token first (python3 mint_token.py)"; return; }
+  chat($("msg").value, token).catch((e) => line("\n" + e, "err"));
+};
+$("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
+</script>
+</body>
+</html>
