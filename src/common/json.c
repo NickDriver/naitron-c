@@ -1,5 +1,6 @@
 #include "ntc/json.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,6 +201,64 @@ int ntc_json_escape(char *dst, size_t cap, ntc_slice src) {
     if (o >= cap) return -1;
     dst[o] = '\0';
 #undef PUT
+    return (int)o;
+}
+
+static int emit_rec(const ntc_json *v, char *dst, size_t cap, size_t *o) {
+#define APP(s, n) do { if (*o + (size_t)(n) >= cap) return -1; memcpy(dst + *o, (s), (size_t)(n)); *o += (size_t)(n); } while (0)
+#define APC(ch)   do { if (*o + 1 >= cap) return -1; dst[(*o)++] = (char)(ch); } while (0)
+    switch (v->type) {
+        case NTC_JSON_NULL: APP("null", 4); break;
+        case NTC_JSON_BOOL: if (v->b) APP("true", 4); else APP("false", 5); break;
+        case NTC_JSON_NUM: {
+            char num[32];
+            int n = (v->num == floor(v->num) && fabs(v->num) < 1e15)
+                  ? snprintf(num, sizeof num, "%lld", (long long)v->num)
+                  : snprintf(num, sizeof num, "%g", v->num);
+            if (n < 0) return -1;
+            APP(num, n);
+            break;
+        }
+        case NTC_JSON_STR: {
+            APC('"');
+            int n = ntc_json_escape(dst + *o, cap - *o, v->str);
+            if (n < 0) return -1;
+            *o += (size_t)n;
+            APC('"');
+            break;
+        }
+        case NTC_JSON_ARR:
+            APC('[');
+            for (size_t i = 0; i < v->count; i++) {
+                if (i) APC(',');
+                if (emit_rec(v->items[i], dst, cap, o) < 0) return -1;
+            }
+            APC(']');
+            break;
+        case NTC_JSON_OBJ:
+            APC('{');
+            for (size_t i = 0; i < v->count; i++) {
+                if (i) APC(',');
+                APC('"');
+                int n = ntc_json_escape(dst + *o, cap - *o, v->keys[i]);
+                if (n < 0) return -1;
+                *o += (size_t)n;
+                APC('"'); APC(':');
+                if (emit_rec(v->vals[i], dst, cap, o) < 0) return -1;
+            }
+            APC('}');
+            break;
+    }
+    return 0;
+#undef APP
+#undef APC
+}
+
+int ntc_json_emit(const ntc_json *v, char *dst, size_t cap) {
+    if (!v || cap == 0) return -1;
+    size_t o = 0;
+    if (emit_rec(v, dst, cap, &o) < 0 || o >= cap) return -1;
+    dst[o] = '\0';
     return (int)o;
 }
 

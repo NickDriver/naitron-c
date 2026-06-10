@@ -57,3 +57,16 @@ Wave-3 deep live test).
   redirect_uri is http for localhost. In production set `Secure` cookies (the
   gateway already sets Secure when the request arrived over TLS) and an https
   redirect_uri.
+
+## M13 — schema validation + typed OpenAPI
+
+- **Validator is a documented JSON-Schema subset** (type/required/properties/
+  additionalProperties/items/enum/min-max/min-maxLength/min-maxItems), not the
+  full spec: no `$ref`, `allOf`/`anyOf`/`oneOf`, `pattern`, `format`, or
+  dependent schemas. Add as needed.
+- **Request bodies only.** Query/path-param and response-body validation are not
+  wired (the OpenAPI emits request schemas only). The schema doc is also bounded
+  by the JSON parser's `NTC_JSON_MAX_MEMBERS` (64) per object and the 64 KiB
+  OpenAPI buffer.
+- Schemas load from a single `schema.file` at startup (no live reload); editing
+  it needs a restart (or `ntc dev`).

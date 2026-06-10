@@ -14,6 +14,7 @@
 #include "ntc/poller.h"
 #include "ntc/registry.h"
 #include "ntc/router.h"
+#include "ntc/schema.h"
 #include "ntc/session.h"
 #include "ntc/slice.h"
 #include "ntc/tls.h"
@@ -191,6 +192,10 @@ typedef struct gateway {
     ntc_ca *oauth_ca;            /* trust anchors for the token endpoint */
     ntc_kvstore *sessions;       /* session-id -> "sub\tscope" */
     ntc_kvstore *oauth_pending;  /* oauth state -> pkce verifier */
+    /* schema validation (M13): a parsed { "METHOD /pattern": <schema> } doc */
+    ntc_arena schema_arena;
+    ntc_json *schema_root;
+    bool has_schemas;
 } gateway;
 
 /* ---- forward declarations ---- */
@@ -207,6 +212,7 @@ static void exec_control_command(gateway *g, char *cmdline, char *out, size_t ca
 static int  ctrl_queue(ctrl *ct, uint8_t type, uint32_t rid, const uint8_t *payload, uint32_t plen);
 static int  ctrl_update_poll(gateway *g, ctrl *ct);
 static int  on_ws_readable(gateway *g, conn *c);
+static const ntc_json *gw_schema_for(gateway *g, ntc_slice method, ntc_slice path);
 
 /* ---- utilities ---- */
 static int set_nonblocking(int fd) {
@@ -806,9 +812,24 @@ static int serve_openapi(gateway *g, conn *c) {
         char m[8];
         snprintf(m, sizeof m, "%s", rows[i].method);
         for (char *q = m; *q; q++) *q = (char)tolower((unsigned char)*q);
-        off += (size_t)snprintf(buf + off, cap - off,
-            "%s\"%s\":{\"%s\":{\"summary\":\"-> %s\",\"responses\":{\"200\":{\"description\":\"OK\"}}}}",
-            i ? "," : "", path, m, rows[i].service);
+
+        /* typed: embed the request schema (if any) as requestBody */
+        char schema_emit[8192]; schema_emit[0] = '\0';
+        const ntc_json *sch = gw_schema_for(g, ntc_slice_cstr(rows[i].method),
+                                            ntc_slice_cstr(rows[i].pattern));
+        if (sch && ntc_json_emit(sch, schema_emit, sizeof schema_emit) < 0) schema_emit[0] = '\0';
+
+        if (schema_emit[0] && off + strlen(schema_emit) + 512 < cap) {
+            off += (size_t)snprintf(buf + off, cap - off,
+                "%s\"%s\":{\"%s\":{\"summary\":\"-> %s\",\"requestBody\":{\"required\":true,"
+                "\"content\":{\"application/json\":{\"schema\":%s}}},"
+                "\"responses\":{\"200\":{\"description\":\"OK\"}}}}",
+                i ? "," : "", path, m, rows[i].service, schema_emit);
+        } else {
+            off += (size_t)snprintf(buf + off, cap - off,
+                "%s\"%s\":{\"%s\":{\"summary\":\"-> %s\",\"responses\":{\"200\":{\"description\":\"OK\"}}}}",
+                i ? "," : "", path, m, rows[i].service);
+        }
     }
     off += (size_t)snprintf(buf + off, cap - off, "}}");
     return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
@@ -974,6 +995,66 @@ static int handle_oauth(gateway *g, conn *c, const ntc_request *req) {
     return respond_and_flush(g, c, 404, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
 }
 
+/* ---- request-body schema validation (M13) ---- */
+
+/* match a route pattern (with :param segments) against a concrete path */
+static bool seg_pattern_match(const char *pat, size_t patlen, ntc_slice path) {
+    const char *pp = pat, *pe = pat + patlen;
+    const char *xp = path.ptr, *xe = path.ptr + path.len;
+    while (pp < pe && xp < xe) {
+        if (*pp != '/' || *xp != '/') return false;
+        pp++; xp++;
+        const char *ps = pp; while (pp < pe && *pp != '/') pp++;
+        const char *xs = xp; while (xp < xe && *xp != '/') xp++;
+        size_t plen = (size_t)(pp - ps), xlen = (size_t)(xp - xs);
+        if (plen > 0 && ps[0] == ':') { if (xlen == 0) return false; } /* :param matches any segment */
+        else if (plen != xlen || memcmp(ps, xs, plen) != 0) return false;
+    }
+    return pp == pe && xp == xe;
+}
+
+/* find a registered request schema for METHOD+path (keys are "METHOD /pattern") */
+static const ntc_json *gw_schema_for(gateway *g, ntc_slice method, ntc_slice path) {
+    if (!g->has_schemas || !g->schema_root || g->schema_root->type != NTC_JSON_OBJ) return NULL;
+    for (size_t i = 0; i < g->schema_root->count; i++) {
+        ntc_slice key = g->schema_root->keys[i];
+        const char *sp = memchr(key.ptr, ' ', key.len);
+        if (!sp) continue;
+        size_t mlen = (size_t)(sp - key.ptr);
+        if (mlen != method.len || memcmp(key.ptr, method.ptr, mlen) != 0) continue;
+        if (seg_pattern_match(sp + 1, key.len - mlen - 1, path)) return g->schema_root->vals[i];
+    }
+    return NULL;
+}
+
+/* Validate the request body against any registered schema. Returns 0 to proceed,
+ * or <0 having already sent a 400 (caller must stop). */
+static int gw_validate_body(gateway *g, conn *c, const ntc_request *req) {
+    const ntc_json *sch = gw_schema_for(g, req->method, req->path);
+    if (!sch) return 0;
+    bool body_method = ntc_slice_eq_cstr(req->method, "POST") ||
+                       ntc_slice_eq_cstr(req->method, "PUT") ||
+                       ntc_slice_eq_cstr(req->method, "PATCH");
+    if (!body_method) return 0;
+    if (req->body.len == 0)
+        return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"request body required\"}"));
+    ntc_json *inst = ntc_json_parse(&c->arena, req->body.ptr, req->body.len);
+    if (!inst)
+        return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"invalid JSON body\"}"));
+    char verr[160];
+    if (!ntc_schema_validate(sch, inst, verr, sizeof verr)) {
+        char *eb = ntc_arena_alloc(&c->arena, 256);
+        if (eb) {
+            char esc[200];
+            ntc_json_escape(esc, sizeof esc, ntc_slice_cstr(verr));
+            int n = snprintf(eb, 256, "{\"error\":\"validation failed\",\"detail\":\"%s\"}", esc);
+            if (n > 0) return respond_and_flush(g, c, 400, ntc_slice_new(eb, (size_t)n));
+        }
+        return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"validation failed\"}"));
+    }
+    return 0;
+}
+
 static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     if (g->oauth_enabled && ntc_slice_starts_with(req->path, NTC_SLICE_LIT("/auth/")))
         return handle_oauth(g, c, req);
@@ -1019,6 +1100,9 @@ static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
     if (rs == NTC_ROUTE_METHOD_NOT_ALLOWED)
         return respond_and_flush(g, c, 405, NTC_SLICE_LIT("{\"error\":\"method not allowed\"}"));
     if (h == forward_marker) {
+        /* schema validation (M13): 400 before the request reaches the controller */
+        int vr = gw_validate_body(g, c, req);
+        if (vr != 0) return vr;
         g->m.forwarded++;
         /* enrich the forwarded request with path params + auth identity */
         ntc_request fr = *req;
@@ -2039,6 +2123,37 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
         }
     }
 
+    /* request-body schemas (M13): a JSON file mapping "METHOD /pattern" -> schema */
+    {
+        char sf[256] = ""; bool f = false;
+        if (ntc_registry_get_config(g.reg, "schema.file", sf, sizeof sf, &f) == NTC_OK && f) {}
+        const char *sfe = getenv("NTC_SCHEMA_FILE"); if (sfe) snprintf(sf, sizeof sf, "%s", sfe);
+        if (sf[0]) {
+            FILE *fp = fopen(sf, "rb");
+            if (!fp) { NTC_WARN("schema: cannot read '%s'", sf); }
+            else {
+                fseek(fp, 0, SEEK_END); long sz = ftell(fp); rewind(fp);
+                char *buf = (sz > 0 && sz < 256 * 1024) ? malloc((size_t)sz + 1) : NULL;
+                if (buf && fread(buf, 1, (size_t)sz, fp) == (size_t)sz) {
+                    buf[sz] = '\0';
+                    if (ntc_arena_init(&g.schema_arena, (size_t)sz * 4 + 8192) == NTC_OK) {
+                        g.schema_root = ntc_json_parse(&g.schema_arena, buf, (size_t)sz);
+                        if (g.schema_root && g.schema_root->type == NTC_JSON_OBJ) {
+                            g.has_schemas = true;
+                            NTC_SUCCESS("schema: %zu route schema(s) from %s", g.schema_root->count, sf);
+                        } else {
+                            NTC_WARN("schema: '%s' is not a JSON object of route->schema", sf);
+                            ntc_arena_destroy(&g.schema_arena);
+                            g.schema_root = NULL;
+                        }
+                    }
+                }
+                free(buf);
+                fclose(fp);
+            }
+        }
+    }
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
     g.listen_fd = listen_fd;
@@ -2206,6 +2321,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_mw_free(g.mw);
     ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
+    if (g.has_schemas) ntc_arena_destroy(&g.schema_arena);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_OK;
@@ -2215,6 +2331,7 @@ fail_pre_poll:
     if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     ntc_mw_free(g.mw);
     ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
+    if (g.has_schemas) ntc_arena_destroy(&g.schema_arena);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_ERR_IO;

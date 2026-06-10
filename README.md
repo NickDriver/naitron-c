@@ -54,6 +54,16 @@ ntc config set oauth.client_id     <id>                       # NTC_OAUTH_CLIENT
 ntc config set oauth.client_secret <secret>                   # NTC_OAUTH_CLIENT_SECRET
 ntc config set oauth.redirect_uri  https://app/auth/callback  # NTC_OAUTH_REDIRECT_URI
 ntc config set oauth.ca ./roots.pem                # CA for the token endpoint ("" = bundled)
+```
+
+### Request schemas (validation + typed OpenAPI)
+
+```sh
+# schema.file maps "METHOD /pattern" -> a JSON-Schema (subset). The gateway 400s
+# invalid request bodies before they reach the controller, and /_ntc/openapi.json
+# embeds each schema as the route's requestBody.
+ntc config set schema.file ./schemas.json          # or NTC_SCHEMA_FILE
+# schemas.json: { "POST /api/users": { "type":"object", "required":["email"], ... } }
 
 # TLS termination (PEM cert chain + RSA private key)
 ntc config set tls.cert ./cert.pem                 # or NTC_TLS_CERT

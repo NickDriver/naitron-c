@@ -39,4 +39,8 @@ double ntc_json_num(const ntc_json *v);
  * NUL-terminated. Returns bytes written (excl NUL) or -1 if dst is too small. */
 int ntc_json_escape(char *dst, size_t cap, ntc_slice src);
 
+/* Serialize a parsed node back to compact JSON in dst (NUL-terminated).
+ * Returns bytes written (excl NUL), or -1 if dst is too small. */
+int ntc_json_emit(const ntc_json *v, char *dst, size_t cap);
+
 #endif /* NTC_JSON_H */
