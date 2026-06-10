@@ -40,3 +40,20 @@ Wave-3 deep live test).
 - **No fragmentation reassembly.** Each WS data frame is relayed as its own
   message (CONT frames are forwarded but not coalesced). Fine for typical
   clients that send unfragmented messages; revisit if a client fragments.
+
+## M12 — OAuth2 login + sessions
+
+- **Sessions are in-memory** (a per-process TTL map), so they are lost on
+  restart and not shared across replicas. A SQLite-backed store would survive
+  restarts + scale across worker pools (M14). Eviction is soonest-expiry when
+  full.
+- **id_token validation is HS256-via-client-secret only** in this pass (valid
+  per OIDC, and what the test mock uses). RS256/ES256 id_tokens should reuse the
+  existing `auth.jwks_url` JWKS machinery (`ntc_jwt_verify_jwks`) - wire
+  `oauth.jwks_url` to validate IdPs that sign id_tokens with RS256 (the common
+  case for Google/Auth0). The token exchange + PKCE + session plumbing is
+  IdP-agnostic; only the id_token signature check needs the JWKS branch.
+- The OAuth flow is **plaintext-cookie + same-origin** assumptions: the demo
+  redirect_uri is http for localhost. In production set `Secure` cookies (the
+  gateway already sets Secure when the request arrived over TLS) and an https
+  redirect_uri.

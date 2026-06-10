@@ -5,12 +5,16 @@
 #include "ntc/builtin.h"
 #include "ntc/control.h"
 #include "ntc/http.h"
+#include "ntc/https_client.h"
+#include "ntc/json.h"
+#include "ntc/jwt.h"
 #include "ntc/log.h"
 #include "ntc/mcp.h"
 #include "ntc/middleware.h"
 #include "ntc/poller.h"
 #include "ntc/registry.h"
 #include "ntc/router.h"
+#include "ntc/session.h"
 #include "ntc/slice.h"
 #include "ntc/tls.h"
 #include "ntc/version.h"
@@ -175,6 +179,18 @@ typedef struct gateway {
     long long dev_path_mtime[NTC_DEV_MAX_WATCH]; /* last-seen max mtime (0=unseen) */
     size_t dev_npaths;
     long dev_last_poll_ms;
+    /* OAuth2 login + sessions (M12) */
+    bool oauth_enabled;
+    char oauth_authorize_url[256];
+    char oauth_token_url[256];
+    char oauth_client_id[160];
+    char oauth_client_secret[256];
+    char oauth_redirect_uri[256];
+    char oauth_scopes[160];
+    char oauth_success[128];   /* post-login redirect target (default "/") */
+    ntc_ca *oauth_ca;            /* trust anchors for the token endpoint */
+    ntc_kvstore *sessions;       /* session-id -> "sub\tscope" */
+    ntc_kvstore *oauth_pending;  /* oauth state -> pkce verifier */
 } gateway;
 
 /* ---- forward declarations ---- */
@@ -798,7 +814,169 @@ static int serve_openapi(gateway *g, conn *c) {
     return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
 }
 
+/* ---- OAuth2 login (auth-code + PKCE) + sessions ---- */
+
+static int hexval(int ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int url_encode(const char *s, char *out, size_t cap) {
+    static const char *hex = "0123456789ABCDEF";
+    size_t o = 0;
+    for (; *s && o + 4 < cap; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') out[o++] = (char)ch;
+        else { out[o++] = '%'; out[o++] = hex[ch >> 4]; out[o++] = hex[ch & 15]; }
+    }
+    if (o < cap) out[o] = '\0';
+    return (int)o;
+}
+
+static void url_decode(char *s) {
+    char *o = s;
+    for (char *p = s; *p; p++) {
+        if (*p == '%' && p[1] && p[2]) {
+            int hi = hexval((unsigned char)p[1]), lo = hexval((unsigned char)p[2]);
+            if (hi >= 0 && lo >= 0) { *o++ = (char)(hi * 16 + lo); p += 2; continue; }
+        }
+        if (*p == '+') { *o++ = ' '; continue; }
+        *o++ = *p;
+    }
+    *o = '\0';
+}
+
+static bool query_get(ntc_slice q, const char *key, char *out, size_t cap) {
+    size_t klen = strlen(key);
+    const char *p = q.ptr, *end = q.ptr + q.len;
+    while (p && p < end) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        const char *seg_end = amp ? amp : end;
+        if ((size_t)(seg_end - p) > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            size_t vl = (size_t)(seg_end - v);
+            if (vl >= cap) vl = cap - 1;
+            memcpy(out, v, vl);
+            out[vl] = '\0';
+            return true;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return false;
+}
+
+/* 302 to `location`, optionally setting a cookie. Reuses c->extra_headers. */
+static int oauth_redirect(gateway *g, conn *c, const char *location, const char *set_cookie) {
+    size_t n = (size_t)snprintf(c->extra_headers, sizeof c->extra_headers, "Location: %s\r\n", location);
+    if (set_cookie && n < sizeof c->extra_headers)
+        (void)snprintf(c->extra_headers + n, sizeof c->extra_headers - n, "Set-Cookie: %s\r\n", set_cookie);
+    return send_resp(g, c, 302, NTC_SLICE_LIT("text/html; charset=utf-8"),
+                     NTC_SLICE_LIT("<a href=\"/\">redirecting</a>"));
+}
+
+static int handle_oauth(gateway *g, conn *c, const ntc_request *req) {
+    long now = time(NULL);
+
+    if (ntc_slice_eq_cstr(req->path, "/auth/login")) {
+        char state[40], verifier[64], challenge[64];
+        if (!ntc_random_token(state, sizeof state, 16) ||
+            !ntc_pkce_verifier(verifier, sizeof verifier) ||
+            !ntc_pkce_challenge(verifier, challenge, sizeof challenge))
+            return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"pkce\"}"));
+        ntc_kv_put(g->oauth_pending, state, verifier, now + 600); /* 10 min to complete */
+        char er[400], es[200];
+        url_encode(g->oauth_redirect_uri, er, sizeof er);
+        url_encode(g->oauth_scopes[0] ? g->oauth_scopes : "openid", es, sizeof es);
+        char loc[1000];
+        snprintf(loc, sizeof loc,
+            "%s?response_type=code&client_id=%s&redirect_uri=%s&scope=%s"
+            "&state=%s&code_challenge=%s&code_challenge_method=S256",
+            g->oauth_authorize_url, g->oauth_client_id, er, es, state, challenge);
+        return oauth_redirect(g, c, loc, NULL);
+    }
+
+    if (ntc_slice_eq_cstr(req->path, "/auth/callback")) {
+        char code[512] = "", state[64] = "", verifier[64];
+        query_get(req->query, "code", code, sizeof code);
+        query_get(req->query, "state", state, sizeof state);
+        url_decode(code); url_decode(state);
+        if (!code[0] || !state[0] || !ntc_kv_get(g->oauth_pending, state, now, verifier, sizeof verifier))
+            return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"invalid or expired state\"}"));
+        ntc_kv_del(g->oauth_pending, state);
+
+        char er[400], ec[600];
+        url_encode(g->oauth_redirect_uri, er, sizeof er);
+        url_encode(code, ec, sizeof ec);
+        char body[1800];
+        int bn = snprintf(body, sizeof body,
+            "grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s&code_verifier=%s",
+            ec, er, g->oauth_client_id, verifier);
+        if (g->oauth_client_secret[0] && bn > 0 && (size_t)bn < sizeof body) {
+            char esec[400];
+            url_encode(g->oauth_client_secret, esec, sizeof esec);
+            bn += snprintf(body + bn, sizeof body - (size_t)bn, "&client_secret=%s", esec);
+        }
+
+        char resp[8192], err[80];
+        int rn = ntc_https_post(g->oauth_ca, g->oauth_token_url, "application/x-www-form-urlencoded",
+                                body, (size_t)bn, resp, sizeof resp, 5000, err, sizeof err);
+        if (rn <= 0) {
+            NTC_WARN("oauth: token exchange failed: %s", err);
+            return respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"token exchange failed\"}"));
+        }
+
+        char sub[128] = "", scope[256] = "";
+        bool ok = false;
+        ntc_arena a;
+        if (ntc_arena_init(&a, 16384) == NTC_OK) {
+            ntc_json *root = ntc_json_parse(&a, resp, (size_t)rn);
+            ntc_slice idt = root ? ntc_json_str(ntc_json_get(root, "id_token")) : ntc_slice_new(NULL, 0);
+            if (idt.len && g->oauth_client_secret[0]) {
+                /* OIDC permits HS256 id_tokens signed with the client secret. */
+                ntc_jwt_claims cl;
+                if (ntc_jwt_verify_hs256(idt.ptr, idt.len, g->oauth_client_secret, now, &cl)) {
+                    snprintf(sub, sizeof sub, "%s", cl.sub);
+                    snprintf(scope, sizeof scope, "%s", cl.scope);
+                    ok = true;
+                }
+            }
+            ntc_arena_destroy(&a);
+        }
+        if (!ok) return respond_and_flush(g, c, 401, NTC_SLICE_LIT("{\"error\":\"invalid id_token\"}"));
+
+        char sid[80], val[400];
+        if (!ntc_random_token(sid, sizeof sid, 24))
+            return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"sid\"}"));
+        snprintf(val, sizeof val, "%s\t%s", sub, scope);
+        ntc_kv_put(g->sessions, sid, val, now + 8 * 3600);
+        char cookie[256];
+        ntc_cookie_format(cookie, sizeof cookie, "ntc_session", sid, c->tls != NULL, 8 * 3600);
+        return oauth_redirect(g, c, g->oauth_success[0] ? g->oauth_success : "/", cookie);
+    }
+
+    if (ntc_slice_eq_cstr(req->path, "/auth/logout")) {
+        ntc_slice ck = ntc_http_header(req, "cookie");
+        if (ck.len) {
+            char ckbuf[1024];
+            size_t cl = ck.len < sizeof ckbuf - 1 ? ck.len : sizeof ckbuf - 1;
+            memcpy(ckbuf, ck.ptr, cl); ckbuf[cl] = '\0';
+            char sid[80];
+            if (ntc_cookie_get(ckbuf, "ntc_session", sid, sizeof sid)) ntc_kv_del(g->sessions, sid);
+        }
+        char cookie[256];
+        ntc_cookie_format(cookie, sizeof cookie, "ntc_session", "", c->tls != NULL, 0); /* expire */
+        return oauth_redirect(g, c, g->oauth_success[0] ? g->oauth_success : "/", cookie);
+    }
+
+    return respond_and_flush(g, c, 404, NTC_SLICE_LIT("{\"error\":\"not found\"}"));
+}
+
 static int gw_dispatch(gateway *g, conn *c, const ntc_request *req) {
+    if (g->oauth_enabled && ntc_slice_starts_with(req->path, NTC_SLICE_LIT("/auth/")))
+        return handle_oauth(g, c, req);
     /* reserved framework namespace - never overridable by user routes */
     if (ntc_slice_starts_with(req->path, NTC_SLICE_LIT("/_ntc/"))) {
         if (ntc_slice_eq_cstr(req->path, "/_ntc/health"))
@@ -1040,13 +1218,37 @@ static int process_request(gateway *g, conn *c, bool eof) {
         memcpy(c->log_method, req.method.ptr, ml); c->log_method[ml] = '\0';
         size_t pl = req.path.len < sizeof c->log_path - 1 ? req.path.len : sizeof c->log_path - 1;
         memcpy(c->log_path, req.path.ptr, pl); c->log_path[pl] = '\0';
+        /* resolve a session cookie (OAuth login) -> pre-authenticated identity */
+        bool pre_authed = false;
+        char sess_sub[128] = "", sess_scope[256] = "";
+        if (g->sessions) {
+            ntc_slice ck = ntc_http_header(&req, "cookie");
+            if (ck.len) {
+                char ckbuf[1024];
+                size_t cl = ck.len < sizeof ckbuf - 1 ? ck.len : sizeof ckbuf - 1;
+                memcpy(ckbuf, ck.ptr, cl); ckbuf[cl] = '\0';
+                char sid[80], val[400];
+                if (ntc_cookie_get(ckbuf, "ntc_session", sid, sizeof sid) &&
+                    ntc_kv_get(g->sessions, sid, time(NULL), val, sizeof val)) {
+                    char *tab = strchr(val, '\t');
+                    if (tab) { *tab = '\0'; snprintf(sess_scope, sizeof sess_scope, "%s", tab + 1); }
+                    snprintf(sess_sub, sizeof sess_sub, "%s", val);
+                    pre_authed = true;
+                }
+            }
+        }
         if (g->mw) {
             ntc_mw_result r;
-            bool sc = ntc_mw_before(g->mw, &req, c->client_ip, now_ms(), &r);
+            bool sc = ntc_mw_before(g->mw, &req, c->client_ip, now_ms(), pre_authed, &r);
             snprintf(c->extra_headers, sizeof c->extra_headers, "%s", r.extra_headers);
             snprintf(c->request_id, sizeof c->request_id, "%s", r.request_id);
-            snprintf(c->auth_sub, sizeof c->auth_sub, "%s", r.auth_sub);
-            snprintf(c->auth_scope, sizeof c->auth_scope, "%s", r.auth_scope);
+            if (pre_authed) {
+                snprintf(c->auth_sub, sizeof c->auth_sub, "%s", sess_sub);
+                snprintf(c->auth_scope, sizeof c->auth_scope, "%s", sess_scope);
+            } else {
+                snprintf(c->auth_sub, sizeof c->auth_sub, "%s", r.auth_sub);
+                snprintf(c->auth_scope, sizeof c->auth_scope, "%s", r.auth_scope);
+            }
             if (sc) { rec_status(g, r.status); return send_resp(g, c, r.status, r.content_type, r.body); }
         }
     }
@@ -1804,6 +2006,39 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
         g.mw = ntc_mw_new(&mcfg);
     }
 
+    /* OAuth2 login (M12): enabled when oauth.token_url is configured. */
+    {
+        struct { const char *key; const char *env; char *dst; size_t cap; } oc[] = {
+            { "oauth.authorize_url", "NTC_OAUTH_AUTHORIZE_URL", g.oauth_authorize_url, sizeof g.oauth_authorize_url },
+            { "oauth.token_url",     "NTC_OAUTH_TOKEN_URL",     g.oauth_token_url,     sizeof g.oauth_token_url },
+            { "oauth.client_id",     "NTC_OAUTH_CLIENT_ID",     g.oauth_client_id,     sizeof g.oauth_client_id },
+            { "oauth.client_secret", "NTC_OAUTH_CLIENT_SECRET", g.oauth_client_secret, sizeof g.oauth_client_secret },
+            { "oauth.redirect_uri",  "NTC_OAUTH_REDIRECT_URI",  g.oauth_redirect_uri,  sizeof g.oauth_redirect_uri },
+            { "oauth.scopes",        "NTC_OAUTH_SCOPES",        g.oauth_scopes,        sizeof g.oauth_scopes },
+            { "oauth.success",       "NTC_OAUTH_SUCCESS",       g.oauth_success,       sizeof g.oauth_success },
+        };
+        char v[256]; bool f = false;
+        for (size_t i = 0; i < sizeof oc / sizeof oc[0]; i++) {
+            if (ntc_registry_get_config(g.reg, oc[i].key, v, sizeof v, &f) == NTC_OK && f)
+                snprintf(oc[i].dst, oc[i].cap, "%s", v);
+            const char *e = getenv(oc[i].env);
+            if (e) snprintf(oc[i].dst, oc[i].cap, "%s", e);
+        }
+        if (g.oauth_token_url[0] && g.oauth_authorize_url[0] && g.oauth_client_id[0]) {
+            g.sessions = ntc_kv_new(4096);
+            g.oauth_pending = ntc_kv_new(1024);
+            char ca[256] = ""; bool cf = false;
+            if (ntc_registry_get_config(g.reg, "oauth.ca", ca, sizeof ca, &cf) == NTC_OK && cf) {}
+            const char *cae = getenv("NTC_OAUTH_CA"); if (cae) snprintf(ca, sizeof ca, "%s", cae);
+            g.oauth_ca = ca[0] ? ntc_ca_load_pem(ca) : ntc_ca_default();
+            g.oauth_enabled = g.sessions && g.oauth_pending;
+            if (g.oauth_enabled)
+                NTC_SUCCESS("oauth: login enabled (/auth/login -> %s)", g.oauth_authorize_url);
+            if (!g.oauth_ca)
+                NTC_WARN("oauth: no CA roots for the token endpoint (set oauth.ca); exchange will fail closed");
+        }
+    }
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { NTC_ERROR("socket(): %s", strerror(errno)); goto fail_pre_poll; }
     g.listen_fd = listen_fd;
@@ -1970,6 +2205,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
     if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_mw_free(g.mw);
+    ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_OK;
@@ -1978,6 +2214,7 @@ fail_pre_poll:
     free(g.services);
     if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     ntc_mw_free(g.mw);
+    ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
     return NTC_ERR_IO;

@@ -40,9 +40,11 @@ typedef struct ntc_mw_result {
     char auth_scope[256];
 } ntc_mw_result;
 
-/* Run the before-chain. Returns true if a response should be sent immediately. */
+/* Run the before-chain. Returns true if a response should be sent immediately.
+ * `pre_authed` means the gateway already authenticated the request (e.g. a valid
+ * session cookie), so the bearer/api-key gate is satisfied without a token. */
 bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
-                   long now_ms, ntc_mw_result *r);
+                   long now_ms, bool pre_authed, ntc_mw_result *r);
 
 /* Emit the access log once the final status + duration are known. */
 void ntc_mw_after(ntc_mw *m, const char *method, const char *path,

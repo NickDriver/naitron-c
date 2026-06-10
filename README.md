@@ -45,6 +45,16 @@ ntc config set auth.jwks_url https://issuer/.well-known/jwks.json  # NTC_AUTH_JW
 ntc config set auth.jwks_ca ./roots.pem            # CA roots ("" = bundled); NTC_AUTH_JWKS_CA
 # keys are cached by `kid`; an unknown kid triggers a rate-limited refresh.
 
+# Browser login (OAuth2 auth-code + PKCE) -> session cookie. Enabling
+# oauth.token_url + authorize_url + client_id turns on /auth/login,
+# /auth/callback, /auth/logout; a valid session cookie OR a bearer authorizes.
+ntc config set oauth.authorize_url https://issuer/authorize   # NTC_OAUTH_AUTHORIZE_URL
+ntc config set oauth.token_url     https://issuer/oauth/token # NTC_OAUTH_TOKEN_URL
+ntc config set oauth.client_id     <id>                       # NTC_OAUTH_CLIENT_ID
+ntc config set oauth.client_secret <secret>                   # NTC_OAUTH_CLIENT_SECRET
+ntc config set oauth.redirect_uri  https://app/auth/callback  # NTC_OAUTH_REDIRECT_URI
+ntc config set oauth.ca ./roots.pem                # CA for the token endpoint ("" = bundled)
+
 # TLS termination (PEM cert chain + RSA private key)
 ntc config set tls.cert ./cert.pem                 # or NTC_TLS_CERT
 ntc config set tls.key  ./key.pem                  # or NTC_TLS_KEY

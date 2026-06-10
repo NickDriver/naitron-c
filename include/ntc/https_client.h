@@ -30,4 +30,11 @@ void ntc_ca_free(ntc_ca *ca);
 int ntc_https_get(const ntc_ca *ca, const char *url, char *out, size_t cap,
                   int timeout_ms, char *err, size_t errcap);
 
+/* POST `body` (Content-Type `content_type`, e.g. application/x-www-form-urlencoded)
+ * to `url`. Same verification + return contract as ntc_https_get. Used for the
+ * OAuth2 token exchange. */
+int ntc_https_post(const ntc_ca *ca, const char *url, const char *content_type,
+                   const char *body, size_t blen, char *out, size_t cap,
+                   int timeout_ms, char *err, size_t errcap);
+
 #endif /* NTC_HTTPS_CLIENT_H */

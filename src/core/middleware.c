@@ -140,7 +140,7 @@ static void gen_request_id(char *out, size_t cap) {
 }
 
 bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
-                   long now_ms, ntc_mw_result *r) {
+                   long now_ms, bool pre_authed, ntc_mw_result *r) {
     memset(r, 0, sizeof *r);
     size_t off = 0;
     char *eh = r->extra_headers;
@@ -166,7 +166,7 @@ bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
         }
     }
 
-    if (m->cfg.auth_mode[0] && strcmp(m->cfg.auth_mode, "none") != 0) {
+    if (m->cfg.auth_mode[0] && strcmp(m->cfg.auth_mode, "none") != 0 && !pre_authed) {
         bool protectd = m->cfg.auth_protect[0] == '\0' ||
                         ntc_slice_starts_with(req->path, ntc_slice_cstr(m->cfg.auth_protect));
         if (protectd) {
@@ -256,7 +256,7 @@ TEST(middleware, cors_preflight_short_circuits) {
     req.method = NTC_SLICE_LIT("OPTIONS");
     req.path = NTC_SLICE_LIT("/api/x");
     ntc_mw_result r;
-    ASSERT_TRUE(ntc_mw_before(m, &req, "1.2.3.4", 1000, &r));
+    ASSERT_TRUE(ntc_mw_before(m, &req, "1.2.3.4", 1000, false, &r));
     ASSERT_EQ_INT(204, r.status);
     ASSERT_TRUE(strstr(r.extra_headers, "Access-Control-Allow-Origin: *") != NULL);
     ntc_mw_free(m);
@@ -269,7 +269,7 @@ TEST(middleware, request_id_added) {
     ntc_request req; memset(&req, 0, sizeof req);
     req.method = NTC_SLICE_LIT("GET"); req.path = NTC_SLICE_LIT("/");
     ntc_mw_result r;
-    ASSERT_FALSE(ntc_mw_before(m, &req, "1.2.3.4", 1000, &r));
+    ASSERT_FALSE(ntc_mw_before(m, &req, "1.2.3.4", 1000, false, &r));
     ASSERT_TRUE(strlen(r.request_id) > 0);
     ASSERT_TRUE(strstr(r.extra_headers, "X-Request-Id:") != NULL);
     ntc_mw_free(m);
@@ -282,9 +282,9 @@ TEST(middleware, rate_limit_blocks_burst) {
     ntc_request req; memset(&req, 0, sizeof req);
     req.method = NTC_SLICE_LIT("GET"); req.path = NTC_SLICE_LIT("/");
     ntc_mw_result r;
-    ASSERT_FALSE(ntc_mw_before(m, &req, "9.9.9.9", 1000, &r)); /* 1 */
-    ASSERT_FALSE(ntc_mw_before(m, &req, "9.9.9.9", 1000, &r)); /* 2 */
-    ASSERT_TRUE(ntc_mw_before(m, &req, "9.9.9.9", 1000, &r));  /* 3 -> 429 */
+    ASSERT_FALSE(ntc_mw_before(m, &req, "9.9.9.9", 1000, false, &r)); /* 1 */
+    ASSERT_FALSE(ntc_mw_before(m, &req, "9.9.9.9", 1000, false, &r)); /* 2 */
+    ASSERT_TRUE(ntc_mw_before(m, &req, "9.9.9.9", 1000, false, &r));  /* 3 -> 429 */
     ASSERT_EQ_INT(429, r.status);
     ntc_mw_free(m);
 }

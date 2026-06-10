@@ -307,8 +307,9 @@ static int extract_body(const char *resp, size_t rlen, char *out, size_t cap,
     return (int)w;
 }
 
-int ntc_https_get(const ntc_ca *ca, const char *url, char *out, size_t cap,
-                  int timeout_ms, char *err, size_t errcap) {
+static int https_do(const ntc_ca *ca, const char *method, const char *url,
+                    const char *ctype, const char *body, size_t blen,
+                    char *out, size_t cap, int timeout_ms, char *err, size_t errcap) {
     if (err && errcap) err[0] = '\0';
     if (!ca || ca->num == 0) { set_err(err, errcap, "no trust anchors (fail closed)"); return -1; }
     if (!url || !out || cap == 0) { set_err(err, errcap, "bad args"); return -1; }
@@ -350,11 +351,20 @@ int ntc_https_get(const ntc_ca *ca, const char *url, char *out, size_t cap,
 
     char req[1400];
     int rn = snprintf(req, sizeof req,
-        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: naitron-c\r\n"
-        "Accept: application/json\r\nConnection: close\r\n\r\n", path, host);
+        "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: naitron-c\r\n"
+        "Accept: application/json\r\nConnection: close\r\n",
+        method, path, host);
+    if (rn > 0 && (size_t)rn < sizeof req && body) /* append entity headers for a body */
+        rn += snprintf(req + rn, sizeof req - (size_t)rn,
+                       "Content-Type: %s\r\nContent-Length: %zu\r\n",
+                       ctype ? ctype : "application/x-www-form-urlencoded", blen);
+    if (rn > 0 && (size_t)rn < sizeof req)
+        rn += snprintf(req + rn, sizeof req - (size_t)rn, "\r\n"); /* end of headers */
     int result = -1;
     if (rn > 0 && (size_t)rn < sizeof req &&
-        br_sslio_write_all(&io, req, (size_t)rn) == 0 && br_sslio_flush(&io) == 0) {
+        br_sslio_write_all(&io, req, (size_t)rn) == 0 &&
+        (!body || br_sslio_write_all(&io, body, blen) == 0) &&
+        br_sslio_flush(&io) == 0) {
         /* read the whole response (Connection: close => server EOFs after body) */
         char *resp = malloc(256 * 1024);
         if (resp) {
@@ -388,6 +398,18 @@ int ntc_https_get(const ntc_ca *ca, const char *url, char *out, size_t cap,
     free(b);
     close(fd);
     return result;
+}
+
+int ntc_https_get(const ntc_ca *ca, const char *url, char *out, size_t cap,
+                  int timeout_ms, char *err, size_t errcap) {
+    return https_do(ca, "GET", url, NULL, NULL, 0, out, cap, timeout_ms, err, errcap);
+}
+
+int ntc_https_post(const ntc_ca *ca, const char *url, const char *content_type,
+                   const char *body, size_t blen, char *out, size_t cap,
+                   int timeout_ms, char *err, size_t errcap) {
+    return https_do(ca, "POST", url, content_type, body ? body : "", blen,
+                    out, cap, timeout_ms, err, errcap);
 }
 
 #ifdef UNIT_TEST
