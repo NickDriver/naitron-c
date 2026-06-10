@@ -19,7 +19,9 @@ typedef struct ntc_mw_config {
     char auth_mode[16];     /* "none" | "apikey" | "jwt"              */
     char auth_secret[256];  /* API key, or the HS256 secret           */
     char auth_protect[128]; /* path prefix to protect ("" = all)      */
-    char auth_jwks_file[256];/* JWKS/JWK file for RS256 (mode "jwt")  */
+    char auth_jwks_file[256];/* local JWKS/JWK file (RS256/ES256)     */
+    char auth_jwks_url[256]; /* live JWKS endpoint (https://...)      */
+    char auth_jwks_ca[256];  /* PEM CA roots for the JWKS URL ("" = bundled) */
 } ntc_mw_config;
 
 typedef struct ntc_mw ntc_mw;

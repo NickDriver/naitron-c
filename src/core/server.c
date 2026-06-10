@@ -1501,6 +1501,10 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
             snprintf(mcfg.auth_protect, sizeof mcfg.auth_protect, "%s", v);
         if (ntc_registry_get_config(g.reg, "auth.jwks_file", v, sizeof v, &f) == NTC_OK && f)
             snprintf(mcfg.auth_jwks_file, sizeof mcfg.auth_jwks_file, "%s", v);
+        if (ntc_registry_get_config(g.reg, "auth.jwks_url", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.auth_jwks_url, sizeof mcfg.auth_jwks_url, "%s", v);
+        if (ntc_registry_get_config(g.reg, "auth.jwks_ca", v, sizeof v, &f) == NTC_OK && f)
+            snprintf(mcfg.auth_jwks_ca, sizeof mcfg.auth_jwks_ca, "%s", v);
         /* env overrides (handy for ops/tests) */
         const char *e;
         if ((e = getenv("NTC_CORS_ORIGIN"))) snprintf(mcfg.cors_origin, sizeof mcfg.cors_origin, "%s", e);
@@ -1510,6 +1514,8 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
         if ((e = getenv("NTC_AUTH_SECRET"))) snprintf(mcfg.auth_secret, sizeof mcfg.auth_secret, "%s", e);
         if ((e = getenv("NTC_AUTH_PROTECT"))) snprintf(mcfg.auth_protect, sizeof mcfg.auth_protect, "%s", e);
         if ((e = getenv("NTC_AUTH_JWKS_FILE"))) snprintf(mcfg.auth_jwks_file, sizeof mcfg.auth_jwks_file, "%s", e);
+        if ((e = getenv("NTC_AUTH_JWKS_URL"))) snprintf(mcfg.auth_jwks_url, sizeof mcfg.auth_jwks_url, "%s", e);
+        if ((e = getenv("NTC_AUTH_JWKS_CA"))) snprintf(mcfg.auth_jwks_ca, sizeof mcfg.auth_jwks_ca, "%s", e);
         g.mw = ntc_mw_new(&mcfg);
     }
 

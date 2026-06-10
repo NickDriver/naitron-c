@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ntc/middleware.h"
 #include "ntc/crypto.h"
+#include "ntc/https_client.h"
 #include "ntc/jwt.h"
 #include "ntc/log.h"
 
@@ -12,12 +13,22 @@
 #include <unistd.h>
 
 #define NTC_RL_BUCKETS 1024
+#define NTC_JWKS_MIN_REFRESH_MS 60000 /* at most one live refresh per minute */
+#define NTC_JWKS_FETCH_TIMEOUT_MS 4000
 
 struct ntc_mw {
     ntc_mw_config cfg;
-    ntc_rsa_pubkey rsa_key;             /* parsed JWKS for RS256 (if configured) */
+    ntc_jwks jwks;                      /* parsed signing keys (RS256/ES256) */
+    ntc_ca *jwks_ca;                    /* trust anchors for the JWKS URL */
+    long jwks_last_fetch_ms;            /* monotonic ms of last live fetch (0=never) */
     ntc_bucket buckets[NTC_RL_BUCKETS]; /* keyed by hash(client_ip) */
 };
+
+static long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 /* Read up to `cap`-1 bytes of a file into buf (NUL-terminated). Returns the
  * length, or -1 on error. Used for the (small) JWKS document. */
@@ -33,6 +44,42 @@ static long slurp_file(const char *path, char *buf, size_t cap) {
     return (long)n;
 }
 
+/* Fetch the live JWKS over HTTPS and replace the key set on success. Bounded and
+ * blocking - meant for startup and rare key-rotation refresh (see PROBLEMS.md). */
+static bool mw_fetch_jwks(ntc_mw *m) {
+    if (!m->cfg.auth_jwks_url[0] || !m->jwks_ca) return false;
+    m->jwks_last_fetch_ms = mono_ms();
+    char *doc = malloc(64 * 1024);
+    if (!doc) return false;
+    char err[80];
+    int n = ntc_https_get(m->jwks_ca, m->cfg.auth_jwks_url, doc, 64 * 1024,
+                          NTC_JWKS_FETCH_TIMEOUT_MS, err, sizeof err);
+    bool ok = false;
+    if (n > 0) {
+        ntc_jwks fresh;
+        if (ntc_jwks_parse(doc, (size_t)n, &fresh)) {
+            m->jwks = fresh;
+            NTC_INFO("auth: fetched %zu key(s) from %s", fresh.count, m->cfg.auth_jwks_url);
+            ok = true;
+        } else {
+            NTC_WARN("auth: JWKS from %s did not parse", m->cfg.auth_jwks_url);
+        }
+    } else {
+        NTC_WARN("auth: JWKS fetch from %s failed: %s", m->cfg.auth_jwks_url, err);
+    }
+    free(doc);
+    return ok;
+}
+
+/* Refresh on an unknown-kid token, but no more than once per min-interval (so a
+ * flood of forged kids cannot trigger a fetch storm on the event loop). */
+static void mw_maybe_refresh(ntc_mw *m) {
+    if (!m->cfg.auth_jwks_url[0] || !m->jwks_ca) return;
+    long now = mono_ms();
+    if (m->jwks_last_fetch_ms != 0 && now - m->jwks_last_fetch_ms < NTC_JWKS_MIN_REFRESH_MS) return;
+    (void)mw_fetch_jwks(m);
+}
+
 ntc_mw *ntc_mw_new(const ntc_mw_config *cfg) {
     ntc_mw *m = calloc(1, sizeof *m);
     if (!m) return NULL;
@@ -40,15 +87,27 @@ ntc_mw *ntc_mw_new(const ntc_mw_config *cfg) {
     if (m->cfg.auth_jwks_file[0]) {
         char doc[16384];
         long n = slurp_file(m->cfg.auth_jwks_file, doc, sizeof doc);
-        if (n > 0 && ntc_jwk_parse(doc, (size_t)n, &m->rsa_key))
-            NTC_INFO("auth: loaded RS256 key from %s", m->cfg.auth_jwks_file);
+        if (n > 0 && ntc_jwks_parse(doc, (size_t)n, &m->jwks))
+            NTC_INFO("auth: loaded %zu key(s) from %s", m->jwks.count, m->cfg.auth_jwks_file);
         else
-            NTC_WARN("auth: could not load JWKS '%s'; RS256 tokens will be rejected",
+            NTC_WARN("auth: could not load JWKS '%s'; RS256/ES256 tokens will be rejected",
                      m->cfg.auth_jwks_file);
+    } else if (m->cfg.auth_jwks_url[0]) {
+        m->jwks_ca = m->cfg.auth_jwks_ca[0] ? ntc_ca_load_pem(m->cfg.auth_jwks_ca)
+                                            : ntc_ca_default();
+        if (!m->jwks_ca)
+            NTC_WARN("auth: no CA roots for JWKS URL (set auth.jwks_ca); fetch will fail closed");
+        if (!mw_fetch_jwks(m)) /* prime the cache at startup, off the hot path */
+            NTC_WARN("auth: initial JWKS fetch from %s failed; will retry on demand",
+                     m->cfg.auth_jwks_url);
     }
     return m;
 }
-void ntc_mw_free(ntc_mw *m) { free(m); }
+void ntc_mw_free(ntc_mw *m) {
+    if (!m) return;
+    ntc_ca_free(m->jwks_ca);
+    free(m);
+}
 
 bool ntc_bucket_allow(ntc_bucket *b, long now_ms, double rate_per_sec, double burst) {
     if (b->last_ms == 0) { b->tokens = burst; b->last_ms = now_ms; }
@@ -121,14 +180,20 @@ bool ntc_mw_before(ntc_mw *m, const ntc_request *req, const char *client_ip,
                                                     (const uint8_t *)m->cfg.auth_secret, sl);
                 } else if (strcmp(m->cfg.auth_mode, "jwt") == 0) {
                     /* dispatch on the token's own alg: HS256 -> shared secret,
-                     * RS256 -> the configured JWKS public key. */
+                     * RS256/ES256 -> the JWKS key selected by kid. */
                     ntc_jwt_claims cl;
-                    char alg[16];
-                    if (ntc_jwt_peek_alg(tok.ptr, tok.len, alg, sizeof alg)) {
-                        if (strcmp(alg, "RS256") == 0 && m->rsa_key.present)
-                            ok = ntc_jwt_verify_rs256(tok.ptr, tok.len, &m->rsa_key, time(NULL), &cl);
-                        else if (strcmp(alg, "HS256") == 0 && m->cfg.auth_secret[0])
+                    char alg[16], kid[80];
+                    if (ntc_jwt_peek_header(tok.ptr, tok.len, alg, sizeof alg, kid, sizeof kid)) {
+                        if (strcmp(alg, "RS256") == 0 || strcmp(alg, "ES256") == 0) {
+                            /* live IdPs rotate keys: if we fetch from a URL and the
+                             * kid is unknown, refresh once (rate-limited) then retry. */
+                            if (m->cfg.auth_jwks_url[0] && !ntc_jwks_find(&m->jwks, kid, alg))
+                                mw_maybe_refresh(m);
+                            if (m->jwks.count)
+                                ok = ntc_jwt_verify_jwks(tok.ptr, tok.len, &m->jwks, time(NULL), &cl);
+                        } else if (strcmp(alg, "HS256") == 0 && m->cfg.auth_secret[0]) {
                             ok = ntc_jwt_verify_hs256(tok.ptr, tok.len, m->cfg.auth_secret, time(NULL), &cl);
+                        }
                     }
                     if (ok) {
                         snprintf(r->auth_sub, sizeof r->auth_sub, "%s", cl.sub);
