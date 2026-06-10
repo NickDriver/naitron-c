@@ -75,4 +75,12 @@ NTC_NODISCARD ntc_err ntc_http_format_response_ex(ntc_arena *a, int status,
         const char *status_text, ntc_slice content_type, const char *extra_headers,
         ntc_slice body, ntc_slice *out);
 
+/* Format the HEAD of a streamed response (no body, no Content-Length). If `sse`
+ * is true: Content-Type: text/event-stream + Cache-Control: no-cache (raw
+ * passthrough). Otherwise: Transfer-Encoding: chunked with the given
+ * content_type. Connection: close in both. Body chunks follow separately. */
+NTC_NODISCARD ntc_err ntc_http_format_stream_head(ntc_arena *a, int status,
+        const char *status_text, ntc_slice content_type, bool sse,
+        const char *extra_headers, ntc_slice *out);
+
 #endif /* NTC_HTTP_H */

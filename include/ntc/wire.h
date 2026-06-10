@@ -15,17 +15,29 @@
 #include "ntc/slice.h"
 
 #define NTC_WIRE_MAGIC      0x4E544331u /* "NTC1" */
-#define NTC_WIRE_VERSION    2  /* v2: request carries path params + auth identity */
-#define NTC_WIRE_HEADER_LEN 16
+/* Version byte we WRITE stays 2 so already-compiled v2 controllers keep
+ * accepting gateway frames. The "v3" streaming capability is added purely via
+ * new message types (RESPONSE_BEGIN/CHUNK/END), so readers accept versions
+ * 2..MAX and dispatch on type - a v2 peer simply never sees the new types. */
+#define NTC_WIRE_VERSION     2  /* v2: request carries path params + auth identity */
+#define NTC_WIRE_VERSION_MAX 3  /* v3: streaming response frames */
+#define NTC_WIRE_HEADER_LEN  16
 
 typedef enum ntc_msg_type {
-    NTC_MSG_HELLO    = 1, /* controller -> core: announce name + abi   */
-    NTC_MSG_WELCOME  = 2, /* core -> controller: handshake accepted    */
-    NTC_MSG_REQUEST  = 3, /* core -> controller: a routed HTTP request */
-    NTC_MSG_RESPONSE = 4, /* controller -> core: the response          */
-    NTC_MSG_PING     = 5,
-    NTC_MSG_PONG     = 6
+    NTC_MSG_HELLO          = 1, /* controller -> core: announce name + abi   */
+    NTC_MSG_WELCOME        = 2, /* core -> controller: handshake accepted    */
+    NTC_MSG_REQUEST        = 3, /* core -> controller: a routed HTTP request */
+    NTC_MSG_RESPONSE       = 4, /* controller -> core: the (atomic) response */
+    NTC_MSG_PING           = 5,
+    NTC_MSG_PONG           = 6,
+    NTC_MSG_RESPONSE_BEGIN = 7, /* controller -> core: start of a stream (status+flags+ctype) */
+    NTC_MSG_RESPONSE_CHUNK = 8, /* controller -> core: a body chunk           */
+    NTC_MSG_RESPONSE_END   = 9  /* controller -> core: stream complete (empty payload) */
 } ntc_msg_type;
+
+/* RESPONSE_BEGIN flags: how the gateway frames the stream to the HTTP client. */
+#define NTC_STREAM_FLAG_SSE     0x01 /* text/event-stream, raw passthrough, end-on-close */
+#define NTC_STREAM_FLAG_CHUNKED 0x02 /* Transfer-Encoding: chunked                       */
 
 typedef struct ntc_wire_header {
     uint8_t version;
@@ -54,5 +66,15 @@ ssize_t ntc_wire_encode_response(int status, ntc_slice ctype, ntc_slice body,
 bool ntc_wire_decode_request(const uint8_t *buf, size_t len, ntc_request *req);
 bool ntc_wire_decode_response(const uint8_t *buf, size_t len, int *status,
                               ntc_slice *ctype, ntc_slice *body);
+
+/* Streaming (v3). BEGIN carries status + flags + content-type; CHUNK carries an
+ * opaque body slice (gateway frames it per the flags); END has an empty payload
+ * (no encode/decode needed - just a header with length 0). */
+ssize_t ntc_wire_encode_response_begin(int status, uint8_t flags, ntc_slice ctype,
+                                       uint8_t *out, size_t cap);
+bool ntc_wire_decode_response_begin(const uint8_t *buf, size_t len, int *status,
+                                    uint8_t *flags, ntc_slice *ctype);
+ssize_t ntc_wire_encode_chunk(ntc_slice data, uint8_t *out, size_t cap);
+bool ntc_wire_decode_chunk(const uint8_t *buf, size_t len, ntc_slice *data);
 
 #endif /* NTC_WIRE_H */

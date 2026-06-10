@@ -7,4 +7,16 @@ are deferred. Nothing here blocks moving to the next step.
 |---|-------|------|--------|
 | 1 | M3 | **BearSSL vendoring.** RS256/ES256 JWT (needs RSA/EC verify + JWKS over HTTPS) and OAuth2 login flows (need TLS) require a vetted crypto/TLS lib. **Resolved in M7:** BearSSL vendored as a git submodule at `third_party/bearssl` (built to `libbearssl.a`, linked into core/test/cov only). **RS256 JWT** verification now uses BearSSL's PKCS#1 v1.5 verifier with a static **JWKS/JWK** public key (`auth.jwks_file`); the middleware dispatches HS256 vs RS256 per-token. **TLS termination** wraps gateway connections with `br_ssl_server` driven through the non-blocking event loop (`--tls <port>` + `tls.cert`/`tls.key` PEM). **Still deferred (follow-up):** ES256, **live JWKS-over-HTTPS** fetch (needs the BearSSL TLS *client*), OAuth2 authorization-code+PKCE login. | done in M7 (ES256/JWKS-fetch/OAuth follow-up) |
 | 2 | M3 | Identity (JWT `sub`/scope) is currently only used to gate + log at the gateway. Passing it through to controllers needs the wire-protocol extension in **M4**. | done in M4 |
-| 3 | M6 | **Deferred M6 items.** Implemented: static file serving + auto-OpenAPI (`/_ntc/openapi.json`); **TLS** delivered in M7 (see #1). Still deferred (each is a real feature, not a quick add): **SSE streaming** (needs a streaming connection state machine in the event loop + a streaming controller contract), **gzip/brotli** (needs a deflate impl or vendored zlib), **`ntc dev`** watch+reload (file-watch + rebuild orchestration), **worker pools** (N processes per service — orchestrator extension), **multipart/file-upload** parsing. | OPEN |
+| 3 | M6 | **Deferred M6 items.** Implemented: static file serving + auto-OpenAPI (`/_ntc/openapi.json`); **TLS** delivered in M7 (see #1). Scheduled in the v3 roadmap (`docs/SPEC_v3.md`): **SSE streaming**→M8, **`ntc dev`**→M10, **gzip + worker pools + multipart**→M14. | planned (SPEC_v3) |
+
+## v3 roadmap decisions (2026-06-09)
+
+Agreed when planning M8–M14 (see `docs/SPEC_v3.md`). The user picked all four deferred themes
+plus three additions.
+
+| # | Decision | Choice |
+|---|----------|--------|
+| 4 | **Streaming model (M8).** How do out-of-process controllers stream (the wire is one-shot today)? | **Wire v3** — controllers stream via new `RESPONSE_BEGIN/CHUNK/END` frames; the gateway relays chunks. Version gate **range-accepts [2,3]** so v2 controllers keep working (NOT a hard bump). Rejected: in-core/proxy-only streaming (undercuts the microkernel value prop). |
+| 5 | **JWKS outbound TLS trust (M9).** Verifying an IdP's TLS cert needs CA roots. | **Bundle a CA root set** (BearSSL trust anchors, generated C array), config override `auth.jwks_ca`. Rejected: system CA bundle (brittle across hosts), operator-PEM-only (inconvenient). |
+| 6 | **gzip DEFLATE dependency (M14).** | **Vendor miniz** (single-file, public-domain) under `third_party/`, matching the BearSSL pattern. Rejected: system `-lz` (build/runtime dep). |
+| 7 | **Roadmap additions.** Beyond the four deferred themes, adopt: | **WebSockets** (M11, on the M8 streaming infra), **OAuth2 login** code+PKCE + session/cookie layer (M12, on the M9 TLS client), **schema validation + typed OpenAPI** (M13). Out of scope: HTTP/2/3, gRPC, GraphQL, our own authorization server, large streaming uploads. |

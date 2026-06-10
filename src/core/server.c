@@ -52,7 +52,12 @@
 #define JSON NTC_SLICE_LIT("application/json")
 
 enum { KIND_HTTP = 1, KIND_CTRL = 2, KIND_CONTROL = 3 };
-enum { CS_READ, CS_WAIT, CS_WRITE };
+enum { CS_READ, CS_WAIT, CS_WRITE, CS_STREAM };
+
+/* cap on a single client's buffered-but-unsent streamed bytes; past this the
+ * client can't keep up and is disconnected (never throttle the shared
+ * controller socket - that would stall its other clients). */
+#define NTC_STREAM_MAX_BUF (4u * 1024 * 1024)
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_stop(int sig) { (void)sig; g_stop = 1; }
@@ -90,6 +95,14 @@ typedef struct conn {
     size_t rlen;
     const char *wbuf;
     size_t wlen, wsent;
+    /* streaming (CS_STREAM) state; swbuf is a growable heap drain buffer that
+     * chunks append to and the writer frees as they go out. */
+    bool streaming;       /* this conn is in a streamed response */
+    bool stream_sse;      /* true=SSE raw passthrough, false=chunked framing */
+    bool stream_head_sent;/* the response head has been queued */
+    bool stream_ended;    /* RESPONSE_END seen; close once swbuf drains */
+    uint8_t *swbuf;
+    size_t swlen, swsent, swcap;
     char rbuf[NTC_CONN_RBUF];
 } conn;
 
@@ -237,6 +250,7 @@ static void conn_close(gateway *g, conn *c) {
     (void)ntc_poller_del(g->p, c->fd);
     close(c->fd);
     if (c->tls) ntc_tls_free(c->tls);
+    free(c->swbuf);
     ntc_arena_destroy(&c->arena);
     free(c);
 }
@@ -280,6 +294,21 @@ static int send_resp(gateway *g, conn *c, int status, ntc_slice ctype, ntc_slice
 
 static int on_writable(gateway *g, conn *c) {
     if (c->tls) return tls_drive_write(g, c);
+    if (c->streaming) {
+        while (c->swsent < c->swlen) {
+            ssize_t n = send(c->fd, c->swbuf + c->swsent, c->swlen - c->swsent, MSG_NOSIGNAL);
+            if (n > 0) { c->swsent += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0; /* stay armed */
+            conn_close(g, c);
+            return -1;
+        }
+        c->swlen = c->swsent = 0;                  /* fully drained: reset */
+        if (c->stream_ended) { conn_close(g, c); return -1; }
+        /* nothing to send now - wait for the next chunk (or client EOF) on READ */
+        if (ntc_poller_mod(g->p, c->fd, NTC_POLL_READ, c) != NTC_OK) { conn_close(g, c); return -1; }
+        return 0;
+    }
     while (c->wsent < c->wlen) {
         ssize_t n = send(c->fd, c->wbuf + c->wsent, c->wlen - c->wsent, MSG_NOSIGNAL);
         if (n > 0) { c->wsent += (size_t)n; continue; }
@@ -309,12 +338,19 @@ static int ctrl_update_poll(gateway *g, ctrl *ct) {
     return ntc_poller_mod(g->p, ct->fd, ev, ct) == NTC_OK ? 0 : -1;
 }
 
-static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t len) {
+/* Resolve the client conn for an inflight id (ABA-checked). NULL if it's gone. */
+static conn *gw_conn_for_id(gateway *g, uint32_t id) {
     uint16_t slot = (uint16_t)(id & NTC_INFLIGHT_MASK);
     uint32_t gen = id >> NTC_INFLIGHT_BITS;
     conn *c = g->pending[slot];
-    if (!c || (g->gen[slot] & 0xFFFFFu) != gen) return;
-    gw_free_slot(g, slot);
+    if (!c || (g->gen[slot] & 0xFFFFFu) != gen) return NULL;
+    return c;
+}
+
+static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t len) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c) return;
+    gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
     c->inflight = false;
 
     int status; ntc_slice ctype, body;
@@ -325,6 +361,91 @@ static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t l
     rec_status(g, status);
     if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return; }
     (void)conn_flush(g, c);
+}
+
+/* ---- streamed responses (relay controller chunks to the client) ---- */
+
+/* Arm WRITE + drain the streaming buffer (plaintext or TLS). <0 if conn closed. */
+static int stream_kick(gateway *g, conn *c) {
+    if (c->tls) {
+        int rc = tls_drive_write(g, c);
+        if (rc < 0) return -1;
+        return tls_set_interest(g, c);
+    }
+    if (ntc_poller_mod(g->p, c->fd, NTC_POLL_READ | NTC_POLL_WRITE, c) != NTC_OK) { conn_close(g, c); return -1; }
+    return on_writable(g, c);
+}
+
+/* Append n bytes to the drain buffer (compacting first), enforce the
+ * backpressure cap (disconnect a slow client rather than stall the shared
+ * controller), then push. Returns <0 if the conn was closed. */
+static int stream_push(gateway *g, conn *c, const void *data, size_t n) {
+    if (n) {
+        if (c->swsent > 0) { /* compact consumed prefix to bound growth */
+            memmove(c->swbuf, c->swbuf + c->swsent, c->swlen - c->swsent);
+            c->swlen -= c->swsent; c->swsent = 0;
+        }
+        if (c->swlen + n > NTC_STREAM_MAX_BUF) { conn_close(g, c); return -1; }
+        if (buf_reserve(&c->swbuf, &c->swcap, c->swlen + n) != 0) { conn_close(g, c); return -1; }
+        memcpy(c->swbuf + c->swlen, data, n);
+        c->swlen += n;
+    }
+    return stream_kick(g, c);
+}
+
+static void gw_deliver_begin(gateway *g, uint32_t id, const uint8_t *payload, size_t len) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c) return;
+    int status; uint8_t flags; ntc_slice ctype;
+    if (!ntc_wire_decode_response_begin(payload, len, &status, &flags, &ctype)) {
+        gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK)); c->inflight = false;
+        (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"bad stream begin\"}"));
+        return;
+    }
+    rec_status(g, status);
+    c->streaming = true;
+    c->stream_sse = (flags & NTC_STREAM_FLAG_SSE) != 0;
+    c->state = CS_STREAM;
+    ntc_slice head;
+    if (ntc_http_format_stream_head(&c->arena, status, ntc_http_status_text(status), ctype,
+                                    c->stream_sse, c->extra_headers[0] ? c->extra_headers : NULL,
+                                    &head) != NTC_OK) {
+        conn_close(g, c); return;
+    }
+    if (!c->is_admin && !c->logged && g->mw) { /* access-log now; status is known */
+        ntc_mw_after(g->mw, c->log_method, c->log_path, c->request_id, status, now_ms() - c->req_start);
+        c->logged = true;
+    }
+    c->stream_head_sent = true;
+    (void)stream_push(g, c, head.ptr, head.len);
+}
+
+static void gw_deliver_chunk(gateway *g, uint32_t id, const uint8_t *payload, size_t len) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c || !c->streaming) return; /* client gone or no BEGIN -> drop */
+    ntc_slice data;
+    if (!ntc_wire_decode_chunk(payload, len, &data) || data.len == 0) return;
+    if (c->stream_sse) {
+        (void)stream_push(g, c, data.ptr, data.len); /* raw passthrough */
+    } else {
+        char hdr[32];
+        int hn = snprintf(hdr, sizeof hdr, "%zx\r\n", data.len); /* chunked size line */
+        if (hn < 0) return;
+        if (stream_push(g, c, hdr, (size_t)hn) < 0) return;
+        if (stream_push(g, c, data.ptr, data.len) < 0) return;
+        (void)stream_push(g, c, "\r\n", 2);
+    }
+}
+
+static void gw_deliver_end(gateway *g, uint32_t id) {
+    conn *c = gw_conn_for_id(g, id);
+    if (!c) return;
+    gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK)); /* slot done at END */
+    c->inflight = false;
+    if (!c->streaming) { conn_close(g, c); return; } /* END without BEGIN */
+    c->stream_ended = true;
+    if (!c->stream_sse) { (void)stream_push(g, c, "0\r\n\r\n", 5); return; } /* chunked terminator + close */
+    (void)stream_push(g, c, NULL, 0); /* SSE: kick a final drain; on_writable closes when empty */
 }
 
 static void controller_died(gateway *g, ctrl *ct) {
@@ -340,7 +461,10 @@ static void controller_died(gateway *g, ctrl *ct) {
         if (!c || c->wait_ctrl != ct) continue;
         gw_free_slot(g, (uint16_t)i);
         c->inflight = false;
-        (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"controller died\"}"));
+        if (c->stream_head_sent) /* mid-stream: can't inject a 502 into an open body */
+            conn_close(g, c);
+        else
+            (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"controller died\"}"));
     }
 
     if (svc) {
@@ -390,7 +514,13 @@ static int on_ctrl_readable(gateway *g, ctrl *ct) {
         int r = ntc_wire_read_frame(ct->rbuf + off, ct->rlen - off, &h, &pl, &consumed);
         if (r == 0) break;
         if (r < 0) { controller_died(g, ct); return -1; }
-        if (h.type == NTC_MSG_RESPONSE) gw_deliver(g, h.request_id, pl, h.length);
+        switch (h.type) {
+            case NTC_MSG_RESPONSE:       gw_deliver(g, h.request_id, pl, h.length); break;
+            case NTC_MSG_RESPONSE_BEGIN: gw_deliver_begin(g, h.request_id, pl, h.length); break;
+            case NTC_MSG_RESPONSE_CHUNK: gw_deliver_chunk(g, h.request_id, pl, h.length); break;
+            case NTC_MSG_RESPONSE_END:   gw_deliver_end(g, h.request_id); break;
+            default: break;
+        }
         off += consumed;
     }
     if (off > 0) { memmove(ct->rbuf, ct->rbuf + off, ct->rlen - off); ct->rlen -= off; }
@@ -791,26 +921,41 @@ static int tls_set_interest(gateway *g, conn *c) {
     uint32_t ev = NTC_POLL_READ;
     if (ntc_tls_wants_write(c->tls)) ev |= NTC_POLL_WRITE;
     if (c->state == CS_WRITE && c->wsent < c->wlen) ev |= NTC_POLL_WRITE;
+    if (c->state == CS_STREAM && c->swsent < c->swlen) ev |= NTC_POLL_WRITE;
     if (ntc_poller_mod(g->p, c->fd, ev, c) != NTC_OK) { conn_close(g, c); return -1; }
     return 0;
 }
 
-/* Push c->wbuf through the engine and out to the socket. Returns <0 if the
- * connection was closed (response fully sent, or error). */
+/* Push the active write buffer (atomic c->wbuf, or the streaming c->swbuf)
+ * through the engine and out to the socket. For a stream, records are flushed
+ * after each drain (so events arrive incrementally) and the connection is only
+ * closed at RESPONSE_END. Returns <0 if the connection was closed. */
 static int tls_drive_write(gateway *g, conn *c) {
+    bool streaming = c->streaming;
     for (;;) {
-        size_t before = c->wsent;
-        while (c->wsent < c->wlen) {
-            int n = ntc_tls_send(c->tls, c->wbuf + c->wsent, c->wlen - c->wsent);
+        const uint8_t *buf = streaming ? c->swbuf : (const uint8_t *)c->wbuf;
+        size_t *sent = streaming ? &c->swsent : &c->wsent;
+        size_t len = streaming ? c->swlen : c->wlen;
+        size_t before = *sent;
+        while (*sent < len) {
+            int n = ntc_tls_send(c->tls, buf + *sent, len - *sent);
             if (n <= 0) break;
-            c->wsent += (size_t)n;
+            *sent += (size_t)n;
         }
-        if (c->wsent >= c->wlen) { ntc_tls_flush(c->tls); ntc_tls_close_notify(c->tls); }
+        bool done = (*sent >= len);
+        if (done) {
+            ntc_tls_flush(c->tls); /* emit records now (incremental SSE) */
+            if (!streaming || c->stream_ended) ntc_tls_close_notify(c->tls);
+        }
         if (ntc_tls_pump_socket(c->tls, c->fd) < 0) { conn_close(g, c); return -1; }
         if (ntc_tls_closed(c->tls)) { conn_close(g, c); return -1; }
-        if (ntc_tls_wants_write(c->tls)) return 0;       /* socket full: await writable */
-        if (c->wsent >= c->wlen) { conn_close(g, c); return -1; } /* fully delivered */
-        if (c->wsent == before) return 0;                /* no progress: avoid spin */
+        if (ntc_tls_wants_write(c->tls)) return 0;     /* socket full: await writable */
+        if (done) {
+            if (!streaming || c->stream_ended) { conn_close(g, c); return -1; } /* fully delivered */
+            c->swlen = c->swsent = 0;                  /* stream drained, await next chunk */
+            return 0;
+        }
+        if (*sent == before) return 0;                 /* no progress: avoid spin */
     }
 }
 
@@ -836,8 +981,8 @@ static void on_tls_event(gateway *g, conn *c) {
         char tmp[256];
         while (ntc_tls_recv(c->tls, tmp, sizeof tmp) > 0) { } /* discard until response */
         if (ntc_tls_closed(c->tls)) { conn_close(g, c); return; }
-    } else { /* CS_WRITE */
-        rc = tls_drive_write(g, c);
+    } else { /* CS_WRITE or CS_STREAM */
+        rc = tls_drive_write(g, c); /* drains active buffer; detects client close */
     }
     if (rc < 0) return; /* conn closed by the drive */
     (void)tls_set_interest(g, c);
@@ -1496,6 +1641,9 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port) {
                 if ((evs[i].events & NTC_POLL_READ) && on_readable(&g, c) < 0) continue;
             } else if (c->state == CS_WAIT) {
                 if (evs[i].events & NTC_POLL_READ) on_wait_readable(&g, c);
+            } else if (c->state == CS_STREAM) {
+                if ((evs[i].events & NTC_POLL_WRITE) && on_writable(&g, c) < 0) continue;
+                if (evs[i].events & NTC_POLL_READ) on_wait_readable(&g, c); /* detect client EOF */
             } else {
                 if (evs[i].events & NTC_POLL_WRITE) (void)on_writable(&g, c);
             }
