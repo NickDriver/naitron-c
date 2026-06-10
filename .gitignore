@@ -12,3 +12,7 @@ build/
 # Rust SDK build artifacts
 sdk/rust/target/
 sdk/rust/Cargo.lock
+
+# python bytecode
+__pycache__/
+*.pyc
