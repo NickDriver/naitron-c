@@ -70,3 +70,17 @@ Wave-3 deep live test).
   OpenAPI buffer.
 - Schemas load from a single `schema.file` at startup (no live reload); editing
   it needs a restart (or `ntc dev`).
+
+## M14 — gzip + worker pools + multipart + max body
+
+- **gzip is atomic-only.** Streamed (SSE/chunked) and WebSocket payloads are not
+  compressed. Threshold is 256 B, text-ish content types only.
+- **max_body is bounded by the per-conn read buffer (`NTC_CONN_RBUF`, 64 KiB).**
+  `max_body` can only *lower* the limit; raising it past the buffer needs a
+  growable per-conn buffer (and streaming/chunked *request* bodies remain future
+  work). Multipart uploads therefore cap at ~64 KiB for now.
+- **Replicas are processes, capped at `NTC_MAX_REPLICAS` (8) per service**, with
+  in-memory round-robin (no sticky sessions, no health-weighting). Scaling state
+  persists in the registry config (`replicas:<name>`); the `service scale` change
+  is live. Sessions (M12) are per-process, so OAuth login + replicas don't share
+  session state yet (would need the shared/SQLite session store).

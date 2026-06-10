@@ -64,6 +64,17 @@ ntc config set oauth.ca ./roots.pem                # CA for the token endpoint (
 # embeds each schema as the route's requestBody.
 ntc config set schema.file ./schemas.json          # or NTC_SCHEMA_FILE
 # schemas.json: { "POST /api/users": { "type":"object", "required":["email"], ... } }
+```
+
+### Production (gzip, replicas, body limit)
+
+```sh
+# gzip: text/JSON responses over 256 B are compressed when the client sends
+# Accept-Encoding: gzip (automatic, atomic responses).
+ntc service scale <name> <n>            # run N replicas of a controller (round-robin)
+ntc config set max_body 1048576         # reject request bodies over N bytes (413); or NTC_MAX_BODY
+# multipart/form-data uploads: parse in the controller with ntc_multipart_parse()
+# (see controllers/upload_echo.c).
 
 # TLS termination (PEM cert chain + RSA private key)
 ntc config set tls.cert ./cert.pem                 # or NTC_TLS_CERT

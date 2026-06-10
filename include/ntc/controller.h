@@ -71,4 +71,21 @@ int ntc_ws_send(ntc_ws *ws, int opcode, const void *data, size_t len);
 int ntc_ws_send_text(ntc_ws *ws, const char *text);
 int ntc_ws_close(ntc_ws *ws);
 
+/* ---- multipart/form-data parsing (the body arrives as one blob) ----
+ * Slices point into `body` (no copies). */
+typedef struct ntc_multipart_part {
+    ntc_slice name;          /* form field name                  */
+    ntc_slice filename;      /* upload filename ("" if not a file) */
+    ntc_slice content_type;  /* part Content-Type ("" if absent)  */
+    ntc_slice data;          /* the part body                     */
+} ntc_multipart_part;
+
+/* Extract the boundary token from a multipart Content-Type header value. */
+bool ntc_multipart_boundary(ntc_slice content_type, char *out, size_t cap);
+
+/* Parse a multipart/form-data body into parts[] (up to max). Returns the part
+ * count, or -1 on malformed input. */
+int ntc_multipart_parse(ntc_slice body, const char *boundary,
+                        ntc_multipart_part *parts, int max);
+
 #endif /* NTC_CONTROLLER_H */

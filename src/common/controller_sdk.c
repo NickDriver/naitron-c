@@ -144,6 +144,74 @@ int ntc_ws_close(ntc_ws *ws) {
     return send_frame(ws->fd, NTC_MSG_WS_CLOSE, ws->rid, cb, (uint32_t)pn);
 }
 
+/* ---- multipart/form-data ---- */
+
+bool ntc_multipart_boundary(ntc_slice content_type, char *out, size_t cap) {
+    const char *b = memmem(content_type.ptr, content_type.len, "boundary=", 9);
+    if (!b) return false;
+    b += 9;
+    const char *e = content_type.ptr + content_type.len;
+    if (b < e && *b == '"') { b++; const char *q = memchr(b, '"', (size_t)(e - b)); if (q) e = q; }
+    else { const char *semi = memchr(b, ';', (size_t)(e - b)); if (semi) e = semi; }
+    size_t n = (size_t)(e - b);
+    if (n == 0 || n >= cap) return false;
+    memcpy(out, b, n); out[n] = '\0';
+    return true;
+}
+
+/* pull foo="bar" out of [start,end) into *slot */
+static void mp_quoted(const char *start, const char *end, const char *key, ntc_slice *slot) {
+    size_t kl = strlen(key);
+    const char *k = memmem(start, (size_t)(end - start), key, kl);
+    if (!k) return;
+    k += kl;
+    const char *q = memchr(k, '"', (size_t)(end - k));
+    if (q) *slot = ntc_slice_new(k, (size_t)(q - k));
+}
+
+int ntc_multipart_parse(ntc_slice body, const char *boundary,
+                        ntc_multipart_part *parts, int max) {
+    char delim[260], sep[264];
+    int dl = snprintf(delim, sizeof delim, "--%s", boundary);
+    int sl = snprintf(sep, sizeof sep, "\r\n--%s", boundary);
+    if (dl <= 0 || dl >= (int)sizeof delim || sl <= 0) return -1;
+
+    const char *end = body.ptr + body.len;
+    const char *cur = memmem(body.ptr, body.len, delim, (size_t)dl);
+    if (!cur) return -1;
+    cur += dl;
+
+    int count = 0;
+    while (cur < end && count < max) {
+        if (cur + 2 <= end && cur[0] == '-' && cur[1] == '-') break;      /* closing -- */
+        if (cur + 2 <= end && cur[0] == '\r' && cur[1] == '\n') cur += 2; /* end of boundary line */
+        else break;
+        const char *next = memmem(cur, (size_t)(end - cur), sep, (size_t)sl);
+        if (!next) break;
+
+        ntc_multipart_part part;
+        memset(&part, 0, sizeof part);
+        const char *hdr_end = memmem(cur, (size_t)(next - cur), "\r\n\r\n", 4);
+        const char *data_start = cur;
+        if (hdr_end) {
+            mp_quoted(cur, hdr_end, "name=\"", &part.name);
+            mp_quoted(cur, hdr_end, "filename=\"", &part.filename);
+            const char *ct = memmem(cur, (size_t)(hdr_end - cur), "Content-Type:", 13);
+            if (ct) {
+                ct += 13;
+                while (ct < hdr_end && *ct == ' ') ct++;
+                const char *eol = memmem(ct, (size_t)(hdr_end - ct), "\r\n", 2);
+                part.content_type = ntc_slice_new(ct, (size_t)((eol ? eol : hdr_end) - ct));
+            }
+            data_start = hdr_end + 4;
+        }
+        part.data = ntc_slice_new(data_start, (size_t)(next - data_start));
+        parts[count++] = part;
+        cur = next + sl;
+    }
+    return count;
+}
+
 int ntc_controller_run(const ntc_controller *ctl) {
     if (!ctl || (!ctl->handle && !ctl->stream && !ctl->ws_open && !ctl->ws_message))
         return 2;
@@ -253,3 +321,38 @@ int ntc_controller_run(const ntc_controller *ctl) {
     }
     return 0;
 }
+
+#ifdef UNIT_TEST
+#include "ntc/test.h"
+
+TEST(multipart, boundary_extract) {
+    char b[64];
+    ASSERT_TRUE(ntc_multipart_boundary(NTC_SLICE_LIT("multipart/form-data; boundary=abc123"), b, sizeof b));
+    ASSERT_TRUE(strcmp(b, "abc123") == 0);
+    ASSERT_TRUE(ntc_multipart_boundary(NTC_SLICE_LIT("multipart/form-data; boundary=\"q-d-q\"; x=1"), b, sizeof b));
+    ASSERT_TRUE(strcmp(b, "q-d-q") == 0);
+    ASSERT_FALSE(ntc_multipart_boundary(NTC_SLICE_LIT("application/json"), b, sizeof b));
+}
+
+TEST(multipart, parse_fields_and_file) {
+    const char *body =
+        "--X\r\n"
+        "Content-Disposition: form-data; name=\"field\"\r\n\r\n"
+        "hello world\r\n"
+        "--X\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n"
+        "Content-Type: text/plain\r\n\r\n"
+        "FILE\r\nDATA\r\n"
+        "--X--\r\n";
+    ntc_multipart_part parts[8];
+    int n = ntc_multipart_parse(ntc_slice_new(body, strlen(body)), "X", parts, 8);
+    ASSERT_EQ_INT(2, n);
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[0].name, "field"));
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[0].data, "hello world"));
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[1].name, "file"));
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[1].filename, "a.txt"));
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[1].content_type, "text/plain"));
+    /* data may contain CRLF internally; only the trailing CRLF before the boundary is stripped */
+    ASSERT_TRUE(ntc_slice_eq_cstr(parts[1].data, "FILE\r\nDATA"));
+}
+#endif /* UNIT_TEST */

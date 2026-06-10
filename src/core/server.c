@@ -4,6 +4,7 @@
 #include "ntc/arena.h"
 #include "ntc/builtin.h"
 #include "ntc/control.h"
+#include "ntc/gzip.h"
 #include "ntc/http.h"
 #include "ntc/https_client.h"
 #include "ntc/json.h"
@@ -46,7 +47,7 @@
 #endif
 
 #define NTC_MAX_EVENTS     256
-#define NTC_CONN_RBUF      (16 * 1024)
+#define NTC_CONN_RBUF      (64 * 1024)   /* per-conn read buffer (headers + body) */
 #define NTC_INFLIGHT_BITS  12
 #define NTC_MAX_INFLIGHT   (1u << NTC_INFLIGHT_BITS)
 #define NTC_INFLIGHT_MASK  (NTC_MAX_INFLIGHT - 1u)
@@ -98,6 +99,7 @@ typedef struct conn {
     char auth_scope[256];
     long req_start;
     bool logged;
+    bool accept_gzip;    /* client sent Accept-Encoding: gzip */
     ntc_arena arena;
     size_t rlen;
     const char *wbuf;
@@ -124,15 +126,19 @@ typedef struct ctrl {
     uint8_t *wbuf; size_t wlen, wsent, wcap;
 } ctrl;
 
+#define NTC_MAX_REPLICAS 8
+
 typedef struct service {
     char *name;
     char *bin;
-    ctrl *conn;          /* current process connection; NULL when down */
-    bool disabled;       /* removed via control plane; do not restart */
+    ctrl *conns[NTC_MAX_REPLICAS];     /* per-replica process conn; NULL = down */
+    int replicas;                      /* desired replica count (>=1)           */
+    int rr;                            /* round-robin cursor for forwarding      */
+    bool disabled;                     /* removed via control plane; don't restart */
     int restart_count;
-    long restart_at;     /* monotonic ms; when to (re)spawn */
-    long spawned_at;     /* monotonic ms; current process start */
-    int backoff_ms;
+    long restart_at[NTC_MAX_REPLICAS]; /* monotonic ms; when to (re)spawn slot   */
+    long spawned_at[NTC_MAX_REPLICAS]; /* monotonic ms; slot process start       */
+    int backoff_ms[NTC_MAX_REPLICAS];
     long long bin_mtime; /* dev mode: last-seen mtime of `bin` (0 = unseen) */
     struct gateway *gw;
 } service;
@@ -196,6 +202,7 @@ typedef struct gateway {
     ntc_arena schema_arena;
     ntc_json *schema_root;
     bool has_schemas;
+    size_t max_body; /* max request body bytes (413 over this); 0 = buffer cap */
 } gateway;
 
 /* ---- forward declarations ---- */
@@ -207,7 +214,11 @@ static int  tls_drive_write(gateway *g, conn *c);
 static int  tls_set_interest(gateway *g, conn *c);
 static void on_tls_event(gateway *g, conn *c);
 static void controller_died(gateway *g, ctrl *ct);
-static int  spawn_service(gateway *g, service *svc);
+static int  spawn_service(gateway *g, service *svc, int slot);
+static ctrl *svc_pick(service *svc);
+static bool  svc_any_live(const service *svc);
+static int   svc_live_count(const service *svc);
+static int   svc_slot_of(service *svc, const ctrl *ct);
 static void exec_control_command(gateway *g, char *cmdline, char *out, size_t cap);
 static int  ctrl_queue(ctrl *ct, uint8_t type, uint32_t rid, const uint8_t *payload, uint32_t plen);
 static int  ctrl_update_poll(gateway *g, ctrl *ct);
@@ -299,7 +310,40 @@ static void conn_close(gateway *g, conn *c) {
     free(c);
 }
 
+static bool slice_has(ntc_slice hay, const char *needle) {
+    size_t m = strlen(needle);
+    if (m == 0 || hay.len < m) return false;
+    for (size_t i = 0; i + m <= hay.len; i++)
+        if (memcmp(hay.ptr + i, needle, m) == 0) return true;
+    return false;
+}
+
+/* gzip is worth it for text-ish payloads over a small threshold */
+static bool ctype_compressible(ntc_slice ct) {
+    return ntc_slice_starts_with(ct, NTC_SLICE_LIT("text/")) ||
+           slice_has(ct, "json") || slice_has(ct, "javascript") ||
+           slice_has(ct, "xml") || slice_has(ct, "svg");
+}
+
+#define NTC_GZIP_MIN 256u
+
 static int conn_respond(conn *c, int status, ntc_slice ctype, ntc_slice body) {
+    /* gzip the (atomic) body when the client accepts it and it's worthwhile */
+    if (c->accept_gzip && body.len >= NTC_GZIP_MIN && ctype_compressible(ctype) &&
+        strstr(c->extra_headers, "Content-Encoding") == NULL) {
+        size_t gzlen = 0;
+        uint8_t *gz = ntc_gzip(body.ptr, body.len, &gzlen);
+        if (gz) {
+            char *cp = ntc_arena_alloc(&c->arena, gzlen); /* outlive the send */
+            if (cp) {
+                memcpy(cp, gz, gzlen);
+                body = ntc_slice_new(cp, gzlen);
+                size_t el = strlen(c->extra_headers);
+                snprintf(c->extra_headers + el, sizeof c->extra_headers - el, "Content-Encoding: gzip\r\n");
+            }
+            free(gz);
+        }
+    }
     ntc_slice resp;
     if (ntc_http_format_response_ex(&c->arena, status, ntc_http_status_text(status), ctype,
                                     c->extra_headers[0] ? c->extra_headers : NULL,
@@ -579,7 +623,8 @@ static int on_ws_readable(gateway *g, conn *c) {
 static int gw_ws_upgrade(gateway *g, conn *c, const ntc_request *req, service *svc) {
     if (c->tls) /* wss (WS over TLS) inbound framing is not wired yet (see PROBLEMS.md) */
         return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"wss not supported yet\"}"));
-    if (svc->disabled || !svc->conn)
+    ctrl *target = svc->disabled ? NULL : svc_pick(svc);
+    if (!target)
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"service unavailable\"}"));
     ntc_slice key = ntc_http_header(req, "sec-websocket-key");
     if (key.len == 0 || key.len > 64)
@@ -593,16 +638,16 @@ static int gw_ws_upgrade(gateway *g, conn *c, const ntc_request *req, service *s
     if (pl < 0) { free(enc); return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"encode failed\"}")); }
     uint32_t id;
     if (gw_alloc_id(g, c, &id) != 0) { free(enc); return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"too many in-flight\"}")); }
-    if (ctrl_queue(svc->conn, NTC_MSG_WS_OPEN, id, enc, (uint32_t)pl) != 0) {
+    if (ctrl_queue(target, NTC_MSG_WS_OPEN, id, enc, (uint32_t)pl) != 0) {
         free(enc); gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"queue full\"}"));
     }
     free(enc);
-    (void)ctrl_update_poll(g, svc->conn);
+    (void)ctrl_update_poll(g, target);
 
     c->req_id = id;
     c->inflight = true;
-    c->wait_ctrl = svc->conn;
+    c->wait_ctrl = target;
     c->is_ws = true;
     c->streaming = true;       /* reuse the swbuf outbound-drain machinery */
     c->stream_head_sent = true;
@@ -642,12 +687,15 @@ static void controller_died(gateway *g, ctrl *ct) {
     }
 
     if (svc) {
-        svc->conn = NULL;
-        svc->restart_count++;
-        int b = svc->backoff_ms ? svc->backoff_ms * 2 : NTC_BACKOFF_BASE;
-        if (b > NTC_BACKOFF_MAX) b = NTC_BACKOFF_MAX;
-        svc->backoff_ms = b;
-        svc->restart_at = now_ms() + b;
+        int s = svc_slot_of(svc, ct);
+        if (s >= 0) {
+            svc->conns[s] = NULL;
+            svc->restart_count++;
+            int b = svc->backoff_ms[s] ? svc->backoff_ms[s] * 2 : NTC_BACKOFF_BASE;
+            if (b > NTC_BACKOFF_MAX) b = NTC_BACKOFF_MAX;
+            svc->backoff_ms[s] = b;
+            svc->restart_at[s] = now_ms() + b;
+        }
     }
     free(ct->rbuf);
     free(ct->wbuf);
@@ -710,7 +758,8 @@ static int forward_marker(const ntc_request *r, const ntc_route_params *p,
 }
 
 static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc) {
-    if (svc->disabled || !svc->conn)
+    ctrl *target = svc->disabled ? NULL : svc_pick(svc); /* round-robin across replicas */
+    if (!target)
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"service unavailable\"}"));
 
     uint8_t *enc = ntc_arena_alloc(&c->arena, NTC_CONN_RBUF + 1024);
@@ -721,15 +770,15 @@ static int gw_forward(gateway *g, conn *c, const ntc_request *req, service *svc)
     uint32_t id;
     if (gw_alloc_id(g, c, &id) != 0)
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"too many in-flight\"}"));
-    if (ctrl_queue(svc->conn, NTC_MSG_REQUEST, id, enc, (uint32_t)pl) != 0) {
+    if (ctrl_queue(target, NTC_MSG_REQUEST, id, enc, (uint32_t)pl) != 0) {
         gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
         return respond_and_flush(g, c, 503, NTC_SLICE_LIT("{\"error\":\"queue full\"}"));
     }
     c->state = CS_WAIT;
     c->req_id = id;
     c->inflight = true;
-    c->wait_ctrl = svc->conn;
-    (void)ctrl_update_poll(g, svc->conn);
+    c->wait_ctrl = target;
+    (void)ctrl_update_poll(g, target);
     return 0;
 }
 
@@ -1222,11 +1271,14 @@ static int handle_admin(gateway *g, conn *c, const ntc_request *req) {
         size_t off = (size_t)snprintf(buf, cap, "[");
         for (size_t i = 0; i < g->nservices && off < cap - 512; i++) {
             service *svc = &g->services[i];
-            const char *st = svc->disabled ? "disabled" : (svc->conn ? "up" : "down");
-            long up = svc->conn ? (t - svc->spawned_at) / 1000 : 0;
+            bool live = svc_any_live(svc);
+            const char *st = svc->disabled ? "disabled" : (live ? "up" : "down");
+            long up = live ? (t - svc->spawned_at[0]) / 1000 : 0;
             off += (size_t)snprintf(buf + off, cap - off,
-                "%s{\"name\":\"%s\",\"bin\":\"%s\",\"status\":\"%s\",\"restarts\":%d,\"uptime_s\":%ld}",
-                i ? "," : "", svc->name, svc->bin, st, svc->restart_count, up);
+                "%s{\"name\":\"%s\",\"bin\":\"%s\",\"status\":\"%s\",\"restarts\":%d,"
+                "\"replicas\":%d,\"live\":%d,\"uptime_s\":%ld}",
+                i ? "," : "", svc->name, svc->bin, st, svc->restart_count,
+                svc->replicas, svc_live_count(svc), up);
         }
         off += (size_t)snprintf(buf + off, cap - off, "]");
         return send_resp(g, c, 200, JSON, ntc_slice_new(buf, off));
@@ -1286,6 +1338,9 @@ static int process_request(gateway *g, conn *c, bool eof) {
     if (pr == NTC_PARSE_ERROR)
         return respond_and_flush(g, c, 400, NTC_SLICE_LIT("{\"error\":\"bad request\"}"));
 
+    if (req.has_content_length && g->max_body && req.content_length > g->max_body)
+        return respond_and_flush(g, c, 413, NTC_SLICE_LIT("{\"error\":\"request body too large\"}"));
+
     size_t need = consumed;
     if (req.has_content_length &&
         ntc_size_add(consumed, req.content_length, &need) != NTC_OK)
@@ -1295,6 +1350,9 @@ static int process_request(gateway *g, conn *c, bool eof) {
         if (c->rlen < sizeof c->rbuf) return 0;
         return respond_and_flush(g, c, 413, NTC_SLICE_LIT("{\"error\":\"body too large\"}"));
     }
+
+    /* remember whether the client accepts gzip (used when sending the response) */
+    c->accept_gzip = slice_has(ntc_http_header(&req, "accept-encoding"), "gzip");
 
     /* middleware before-chain (main conns): request-id, CORS, rate-limit */
     if (!c->is_admin) {
@@ -1514,7 +1572,35 @@ static int make_tls_socket(uint16_t port) {
 }
 
 /* ---- spawn + supervise ---- */
-static int spawn_service(gateway *g, service *svc) {
+
+/* round-robin pick of a live replica (or NULL if all down) */
+static ctrl *svc_pick(service *svc) {
+    int n = svc->replicas > 0 ? svc->replicas : 1;
+    for (int k = 0; k < n; k++) {
+        int i = (svc->rr + k) % n;
+        if (svc->conns[i]) { svc->rr = (i + 1) % n; return svc->conns[i]; }
+    }
+    return NULL;
+}
+
+static bool svc_any_live(const service *svc) {
+    int n = svc->replicas > 0 ? svc->replicas : 1;
+    for (int i = 0; i < n; i++) if (svc->conns[i]) return true;
+    return false;
+}
+
+static int svc_live_count(const service *svc) {
+    int n = svc->replicas > 0 ? svc->replicas : 1, live = 0;
+    for (int i = 0; i < n; i++) if (svc->conns[i]) live++;
+    return live;
+}
+
+static int svc_slot_of(service *svc, const ctrl *ct) {
+    for (int i = 0; i < NTC_MAX_REPLICAS; i++) if (svc->conns[i] == ct) return i;
+    return -1;
+}
+
+static int spawn_service(gateway *g, service *svc, int slot) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return -1;
     pid_t pid = fork();
@@ -1576,8 +1662,8 @@ static int spawn_service(gateway *g, service *svc) {
     if (ntc_poller_add(g->p, fd, NTC_POLL_READ, ct) != NTC_OK) {
         free(ct); close(fd); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1;
     }
-    svc->conn = ct;
-    svc->spawned_at = now_ms();
+    svc->conns[slot] = ct;
+    svc->spawned_at[slot] = now_ms();
     return 0;
 }
 
@@ -1626,26 +1712,33 @@ static long long tree_max_mtime(const char *path) {
 /* Tear down a service's current process and schedule an immediate respawn. Unlike
  * controller_died this is intentional, so it neither logs an error nor applies
  * backoff; in-flight requests on the old process are failed (502 / truncate). */
-static void dev_reload_service(gateway *g, service *svc) {
-    if (svc->conn) {
-        ctrl *ct = svc->conn;
-        (void)ntc_poller_del(g->p, ct->fd);
-        close(ct->fd);
-        kill(ct->pid, SIGTERM);
-        waitpid(ct->pid, NULL, 0);
-        for (uint32_t i = 0; i < NTC_MAX_INFLIGHT; i++) {
-            conn *c = g->pending[i];
-            if (!c || c->wait_ctrl != ct) continue;
-            gw_free_slot(g, (uint16_t)i);
-            c->inflight = false;
-            if (c->stream_head_sent) conn_close(g, c);
-            else (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"reloading\"}"));
-        }
-        free(ct->rbuf); free(ct->wbuf); free(ct);
-        svc->conn = NULL;
+/* Tear down one replica's process and fail its in-flight requests. */
+static void dev_teardown_slot(gateway *g, service *svc, int slot) {
+    ctrl *ct = svc->conns[slot];
+    if (!ct) return;
+    (void)ntc_poller_del(g->p, ct->fd);
+    close(ct->fd);
+    kill(ct->pid, SIGTERM);
+    waitpid(ct->pid, NULL, 0);
+    for (uint32_t i = 0; i < NTC_MAX_INFLIGHT; i++) {
+        conn *c = g->pending[i];
+        if (!c || c->wait_ctrl != ct) continue;
+        gw_free_slot(g, (uint16_t)i);
+        c->inflight = false;
+        if (c->stream_head_sent) conn_close(g, c);
+        else (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"reloading\"}"));
     }
-    svc->backoff_ms = 0;
-    svc->restart_at = now_ms(); /* supervise() respawns on the next tick */
+    free(ct->rbuf); free(ct->wbuf); free(ct);
+    svc->conns[slot] = NULL;
+}
+
+static void dev_reload_service(gateway *g, service *svc) {
+    int n = svc->replicas > 0 ? svc->replicas : 1;
+    for (int i = 0; i < n; i++) {
+        dev_teardown_slot(g, svc, i);
+        svc->backoff_ms[i] = 0;
+        svc->restart_at[i] = now_ms(); /* supervise() respawns on the next tick */
+    }
 }
 
 /* Poll watched paths + controller binaries; rebuild and/or reload on change.
@@ -1691,22 +1784,24 @@ static void supervise(gateway *g) {
     for (size_t i = 0; i < g->nservices; i++) {
         service *svc = &g->services[i];
         if (svc->disabled) continue;
-        if (!svc->conn) {
-            if (t >= svc->restart_at) {
-                if (spawn_service(g, svc) == 0) {
-                    NTC_SUCCESS("controller '%s' %s (pid %ld)", svc->name,
+        int n = svc->replicas > 0 ? svc->replicas : 1;
+        for (int s = 0; s < n; s++) {
+            if (!svc->conns[s]) {
+                if (t < svc->restart_at[s]) continue;
+                if (spawn_service(g, svc, s) == 0) {
+                    NTC_SUCCESS("controller '%s'[%d] %s (pid %ld)", svc->name, s,
                                 svc->restart_count ? "restarted" : "ready",
-                                (long)svc->conn->pid);
+                                (long)svc->conns[s]->pid);
                 } else {
-                    int b = svc->backoff_ms ? svc->backoff_ms * 2 : NTC_BACKOFF_BASE;
+                    int b = svc->backoff_ms[s] ? svc->backoff_ms[s] * 2 : NTC_BACKOFF_BASE;
                     if (b > NTC_BACKOFF_MAX) b = NTC_BACKOFF_MAX;
-                    svc->backoff_ms = b;
-                    svc->restart_at = t + b;
-                    NTC_WARN("controller '%s' spawn failed; retry in %dms", svc->name, b);
+                    svc->backoff_ms[s] = b;
+                    svc->restart_at[s] = t + b;
+                    NTC_WARN("controller '%s'[%d] spawn failed; retry in %dms", svc->name, s, b);
                 }
+            } else if (svc->backoff_ms[s] > NTC_BACKOFF_BASE && t - svc->spawned_at[s] > NTC_STABLE_MS) {
+                svc->backoff_ms[s] = NTC_BACKOFF_BASE; /* stable: reset backoff */
             }
-        } else if (svc->backoff_ms > NTC_BACKOFF_BASE && t - svc->spawned_at > NTC_STABLE_MS) {
-            svc->backoff_ms = NTC_BACKOFF_BASE; /* stable: reset backoff */
         }
     }
 }
@@ -1715,8 +1810,12 @@ static int poll_timeout(gateway *g) {
     int to = 1000;
     long t = now_ms();
     for (size_t i = 0; i < g->nservices; i++) {
-        if (!g->services[i].disabled && !g->services[i].conn) {
-            long d = g->services[i].restart_at - t;
+        service *svc = &g->services[i];
+        if (svc->disabled) continue;
+        int n = svc->replicas > 0 ? svc->replicas : 1;
+        for (int s = 0; s < n; s++) {
+            if (svc->conns[s]) continue;
+            long d = svc->restart_at[s] - t;
             if (d < 0) d = 0;
             if (d < to) to = (int)d;
         }
@@ -1770,7 +1869,15 @@ static ntc_err load_registry(gateway *g) {
         g->services[i].name = strdup(srows[i].name);
         g->services[i].bin = strdup(srows[i].bin);
         g->services[i].gw = g;
-        g->services[i].backoff_ms = NTC_BACKOFF_BASE;
+        g->services[i].replicas = 1; /* default; overridden by replicas:<name> below */
+        char rk[160], rv[16]; bool rf = false;
+        snprintf(rk, sizeof rk, "replicas:%s", srows[i].name);
+        if (ntc_registry_get_config(g->reg, rk, rv, sizeof rv, &rf) == NTC_OK && rf) {
+            int rn = atoi(rv);
+            if (rn >= 1 && rn <= NTC_MAX_REPLICAS) g->services[i].replicas = rn;
+        }
+        const char *re = getenv("NTC_REPLICAS"); /* simple global override for tests/ops */
+        if (re) { int rn = atoi(re); if (rn >= 1 && rn <= NTC_MAX_REPLICAS) g->services[i].replicas = rn; }
     }
 
     ntc_route_row rrows[256];
@@ -1848,10 +1955,10 @@ static service *service_add_live(gateway *g, const char *name, const char *bin) 
     svc->name = strdup(name);
     svc->bin = strdup(bin);
     svc->gw = g;
-    svc->backoff_ms = NTC_BACKOFF_BASE;
+    svc->replicas = 1;
     if (!svc->name || !svc->bin) { free(svc->name); free(svc->bin); return NULL; }
     g->nservices++;
-    (void)spawn_service(g, svc);
+    (void)spawn_service(g, svc, 0);
     return svc;
 }
 
@@ -1913,11 +2020,36 @@ static void exec_control_command(gateway *g, char *cmdline, char *out, size_t ca
         service *svc = find_service(g, name);
         if (svc) {
             svc->disabled = true;
-            if (svc->conn) { ctrl *ct = svc->conn; svc->conn = NULL;
+            for (int s = 0; s < NTC_MAX_REPLICAS; s++) {
+                ctrl *ct = svc->conns[s];
+                if (!ct) continue;
+                svc->conns[s] = NULL;
                 (void)ntc_poller_del(g->p, ct->fd); kill(ct->pid, SIGTERM); close(ct->fd);
-                waitpid(ct->pid, NULL, WNOHANG); free(ct->rbuf); free(ct->wbuf); free(ct); }
+                waitpid(ct->pid, NULL, WNOHANG); free(ct->rbuf); free(ct->wbuf); free(ct);
+            }
         }
         snprintf(out, cap, "%s", e == NTC_OK ? "OK service removed\n" : "ERR not found\n");
+    } else if (strcmp(cmd, "service-scale") == 0) {
+        char *name = strtok_r(NULL, " ", &save);
+        char *ns = strtok_r(NULL, " ", &save);
+        if (!name || !ns) { snprintf(out, cap, "ERR usage: service-scale <name> <replicas>\n"); return; }
+        int n = atoi(ns);
+        if (n < 1 || n > NTC_MAX_REPLICAS) { snprintf(out, cap, "ERR replicas must be 1..%d\n", NTC_MAX_REPLICAS); return; }
+        service *svc = find_service(g, name);
+        if (!svc) { snprintf(out, cap, "ERR service not loaded\n"); return; }
+        /* scaling down: tear down slots beyond the new count now */
+        for (int s = n; s < svc->replicas; s++) {
+            ctrl *ct = svc->conns[s];
+            if (!ct) continue;
+            svc->conns[s] = NULL;
+            (void)ntc_poller_del(g->p, ct->fd); kill(ct->pid, SIGTERM); close(ct->fd);
+            waitpid(ct->pid, NULL, WNOHANG); free(ct->rbuf); free(ct->wbuf); free(ct);
+        }
+        svc->replicas = n; /* scaling up: supervise() spawns the new slots */
+        char key[160];
+        snprintf(key, sizeof key, "replicas:%s", name);
+        (void)ntc_registry_set_config(g->reg, key, ns);
+        snprintf(out, cap, "OK scaled %s to %d replicas\n", name, n);
     } else if (strcmp(cmd, "service-list") == 0) {
         ntc_service_row rows[64]; size_t n = 0;
         (void)ntc_registry_list_services(g->reg, rows, 64, &n);
@@ -2123,6 +2255,16 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
         }
     }
 
+    /* max request body (M14). Default = the per-conn buffer; config can only
+     * lower it (the buffer is fixed - larger/streaming uploads are future work). */
+    g.max_body = NTC_CONN_RBUF;
+    {
+        char mb[32] = ""; bool mf = false;
+        if (ntc_registry_get_config(g.reg, "max_body", mb, sizeof mb, &mf) == NTC_OK && mf) {}
+        const char *mbe = getenv("NTC_MAX_BODY"); if (mbe) snprintf(mb, sizeof mb, "%s", mbe);
+        if (mb[0]) { long v = atol(mb); if (v > 0 && (size_t)v < NTC_CONN_RBUF) g.max_body = (size_t)v; }
+    }
+
     /* request-body schemas (M13): a JSON file mapping "METHOD /pattern" -> schema */
     {
         char sf[256] = ""; bool f = false;
@@ -2246,7 +2388,10 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
     }
 
     if (load_registry(&g) != NTC_OK) NTC_WARN("registry load incomplete");
-    for (size_t i = 0; i < g.nservices; i++) (void)spawn_service(&g, &g.services[i]);
+    for (size_t i = 0; i < g.nservices; i++) {
+        int n = g.services[i].replicas > 0 ? g.services[i].replicas : 1;
+        for (int s = 0; s < n; s++) (void)spawn_service(&g, &g.services[i], s);
+    }
 
     NTC_SUCCESS("naitron-c listening on http://0.0.0.0:%u  (%s, %zu routes, %zu services, control %s)",
                 (unsigned)port, ntc_poller_backend(), ntc_router_count(g.router), g.nservices,
@@ -2304,11 +2449,13 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
     NTC_INFO("shutting down");
     for (size_t i = 0; i < g.nservices; i++) {
         service *svc = &g.services[i];
-        if (svc->conn) {
-            kill(svc->conn->pid, SIGTERM);
-            close(svc->conn->fd);
-            waitpid(svc->conn->pid, NULL, 0);
-            free(svc->conn->rbuf); free(svc->conn->wbuf); free(svc->conn);
+        for (int s = 0; s < NTC_MAX_REPLICAS; s++) {
+            ctrl *ct = svc->conns[s];
+            if (!ct) continue;
+            kill(ct->pid, SIGTERM);
+            close(ct->fd);
+            waitpid(ct->pid, NULL, 0);
+            free(ct->rbuf); free(ct->wbuf); free(ct);
         }
         free(svc->name); free(svc->bin);
     }

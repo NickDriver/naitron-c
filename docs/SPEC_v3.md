@@ -1,8 +1,9 @@
 # naitron-c — v3 Spec (post-M7 roadmap: M8–M14)
 
-Status: **agreed 2026-06-09**, implementation in progress (**Wave 1 complete**;
-Wave 2: **M11 + M12 + M13 shipped**; last feature phase: M14 production
-grab-bag, then Wave 3 deep live test). Working spec for the
+Status: **agreed 2026-06-09**. **All feature phases shipped: Wave 1 (M8–M10 +
+dogfood) + Wave 2 (M11–M14).** Remaining: Wave 3 deep live test, which the team
+runs as a separate dogfood project (a real app built ON the framework). Working
+spec for the
 phases after M1–M7 (which shipped: gateway, process-per-service IPC wire v2,
 middleware, auth API-key/HS256/**RS256+TLS** via BearSSL, multi-language SDKs,
 static files, auto-OpenAPI). See `docs/SPEC.md` for the v2 spec, `docs/DECISIONS.md`

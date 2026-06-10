@@ -48,7 +48,7 @@ static void usage(const char *p) {
         "  %s stop | restart <port>                                   stop / restart\n"
         "  %s logs [-f]                                               tail the log\n"
         "  %s status [--json]                                         core status\n"
-        "  %s service add <name> <bin> | list [--json] | rm <name>\n"
+        "  %s service add <name> <bin> | list [--json] | rm <name> | scale <name> <n>\n"
         "  %s route add <METHOD> <path> <svc> | list [--json]\n"
         "  %s config set <key> <value> | get <key>\n"
         "  %s mcp [tools|help]                                        MCP stdio server\n"
@@ -368,6 +368,10 @@ int main(int argc, char **argv) {
         if (strcmp(sub, "rm") == 0) {
             if (argc < 4) { cli_errorf("usage: %s service rm <name>", prog); return 2; }
             snprintf(buf, sizeof buf, "service-rm %s", argv[3]); return do_control(buf);
+        }
+        if (strcmp(sub, "scale") == 0) {
+            if (argc < 5) { cli_errorf("usage: %s service scale <name> <replicas>", prog); return 2; }
+            snprintf(buf, sizeof buf, "service-scale %s %s", argv[3], argv[4]); return do_control(buf);
         }
         cli_errorf("unknown service subcommand '%s'", sub); return 2;
     }
