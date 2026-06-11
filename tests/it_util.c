@@ -19,8 +19,10 @@ pid_t it_spawn(const char *const argv[]) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* quiet the child's stdout/stderr so test output stays clean */
-        int nul = open("/dev/null", O_WRONLY);
+        /* quiet the child's stdout/stderr so test output stays clean (debug:
+         * set NTC_IT_SPAWN_LOG to capture every spawned gateway's output) */
+        const char *dbg = getenv("NTC_IT_SPAWN_LOG");
+        int nul = open(dbg && dbg[0] ? dbg : "/dev/null", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); close(nul); }
         execv(argv[0], (char *const *)argv);
         _exit(127);

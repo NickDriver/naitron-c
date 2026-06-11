@@ -132,3 +132,50 @@ ITEST(m12, oauth_login_session_flow) {
     it_stop(app);
     it_stop(idp);
 }
+
+/* Sessions are SQLite-backed, so a login must survive a gateway restart. */
+ITEST(m12, session_survives_restart) {
+    it_iso("m12persist_idp"); /* IdP gets its own isolation (separate pidfile/sock) */
+    pid_t idp = spawn_idp(38224, 38225);
+    ASSERT_TRUE(idp > 0);
+    ASSERT_TRUE(it_wait_port(38225, 4000));
+
+    /* the APP keeps this isolation across its restart, so its sessions DB
+     * (derived from NTC_DB) persists - we do NOT re-iso before the 2nd spawn */
+    it_iso("m12persist_app");
+    pid_t app = spawn_app(38226, 38225);
+    ASSERT_TRUE(app > 0);
+    ASSERT_TRUE(it_wait_port(38226, 4000));
+
+    /* log in -> session cookie */
+    char rlogin[4096], state[64];
+    ASSERT_TRUE(it_get(38226, "/auth/login", rlogin, sizeof rlogin) > 0);
+    ASSERT_TRUE(extract(rlogin, "state=", "&\r\n", state, sizeof state));
+    char cbpath[128], rcb[4096], sid[128];
+    snprintf(cbpath, sizeof cbpath, "/auth/callback?code=testcode&state=%s", state);
+    ASSERT_TRUE(it_get(38226, cbpath, rcb, sizeof rcb) > 0);
+    ASSERT_EQ_INT(302, it_status(rcb));
+    ASSERT_TRUE(extract(rcb, "ntc_session=", "; \r\n", sid, sizeof sid));
+    char cookie[160];
+    snprintf(cookie, sizeof cookie, "ntc_session=%s", sid);
+
+    /* cookie works before the restart */
+    char rok[2048];
+    ASSERT_TRUE(get_with_cookie(38226, "/api/hello", cookie, rok, sizeof rok) > 0);
+    ASSERT_EQ_INT(200, it_status(rok));
+
+    /* restart ONLY the app (and even drop the IdP) - no re-isolation, so the
+     * sessions DB persists. The same cookie must still authorize. */
+    it_stop(app);
+    it_stop(idp);
+    pid_t app2 = spawn_app(38226, 38225);
+    ASSERT_TRUE(app2 > 0);
+    ASSERT_TRUE(it_wait_port(38226, 4000));
+
+    char rpost[2048];
+    ASSERT_TRUE(get_with_cookie(38226, "/api/hello", cookie, rpost, sizeof rpost) > 0);
+    ASSERT_EQ_INT(200, it_status(rpost)); /* session persisted across the restart */
+    ASSERT_TRUE(strstr(rpost, "\"sub\":\"alice\"") != NULL);
+
+    it_stop(app2);
+}

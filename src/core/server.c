@@ -17,6 +17,7 @@
 #include "ntc/router.h"
 #include "ntc/schema.h"
 #include "ntc/session.h"
+#include "ntc/session_store.h"
 #include "ntc/slice.h"
 #include "ntc/tls.h"
 #include "ntc/version.h"
@@ -196,8 +197,9 @@ typedef struct gateway {
     char oauth_scopes[160];
     char oauth_success[128];   /* post-login redirect target (default "/") */
     ntc_ca *oauth_ca;            /* trust anchors for the token endpoint */
-    ntc_kvstore *sessions;       /* session-id -> "sub\tscope" */
-    ntc_kvstore *oauth_pending;  /* oauth state -> pkce verifier */
+    ntc_session_store *sessions; /* persistent (SQLite) login sessions */
+    long sessions_last_sweep;    /* monotonic ms of the last expired-session sweep */
+    ntc_kvstore *oauth_pending;  /* oauth state -> pkce verifier (in-memory; ephemeral) */
     /* schema validation (M13): a parsed { "METHOD /pattern": <schema> } doc */
     ntc_arena schema_arena;
     ntc_json *schema_root;
@@ -1017,11 +1019,10 @@ static int handle_oauth(gateway *g, conn *c, const ntc_request *req) {
         }
         if (!ok) return respond_and_flush(g, c, 401, NTC_SLICE_LIT("{\"error\":\"invalid id_token\"}"));
 
-        char sid[80], val[400];
+        char sid[80];
         if (!ntc_random_token(sid, sizeof sid, 24))
             return respond_and_flush(g, c, 500, NTC_SLICE_LIT("{\"error\":\"sid\"}"));
-        snprintf(val, sizeof val, "%s\t%s", sub, scope);
-        ntc_kv_put(g->sessions, sid, val, now + 8 * 3600);
+        ntc_session_put(g->sessions, sid, sub, scope, now + 8 * 3600);
         char cookie[256];
         ntc_cookie_format(cookie, sizeof cookie, "ntc_session", sid, c->tls != NULL, 8 * 3600);
         return oauth_redirect(g, c, g->oauth_success[0] ? g->oauth_success : "/", cookie);
@@ -1034,7 +1035,7 @@ static int handle_oauth(gateway *g, conn *c, const ntc_request *req) {
             size_t cl = ck.len < sizeof ckbuf - 1 ? ck.len : sizeof ckbuf - 1;
             memcpy(ckbuf, ck.ptr, cl); ckbuf[cl] = '\0';
             char sid[80];
-            if (ntc_cookie_get(ckbuf, "ntc_session", sid, sizeof sid)) ntc_kv_del(g->sessions, sid);
+            if (ntc_cookie_get(ckbuf, "ntc_session", sid, sizeof sid)) ntc_session_del(g->sessions, sid);
         }
         char cookie[256];
         ntc_cookie_format(cookie, sizeof cookie, "ntc_session", "", c->tls != NULL, 0); /* expire */
@@ -1369,14 +1370,11 @@ static int process_request(gateway *g, conn *c, bool eof) {
                 char ckbuf[1024];
                 size_t cl = ck.len < sizeof ckbuf - 1 ? ck.len : sizeof ckbuf - 1;
                 memcpy(ckbuf, ck.ptr, cl); ckbuf[cl] = '\0';
-                char sid[80], val[400];
+                char sid[80];
                 if (ntc_cookie_get(ckbuf, "ntc_session", sid, sizeof sid) &&
-                    ntc_kv_get(g->sessions, sid, time(NULL), val, sizeof val)) {
-                    char *tab = strchr(val, '\t');
-                    if (tab) { *tab = '\0'; snprintf(sess_scope, sizeof sess_scope, "%s", tab + 1); }
-                    snprintf(sess_sub, sizeof sess_sub, "%s", val);
+                    ntc_session_get(g->sessions, sid, time(NULL),
+                                    sess_sub, sizeof sess_sub, sess_scope, sizeof sess_scope))
                     pre_authed = true;
-                }
             }
         }
         if (g->mw) {
@@ -2241,7 +2239,23 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
             if (e) snprintf(oc[i].dst, oc[i].cap, "%s", e);
         }
         if (g.oauth_token_url[0] && g.oauth_authorize_url[0] && g.oauth_client_id[0]) {
-            g.sessions = ntc_kv_new(4096);
+            /* sessions live in their OWN SQLite, separate from the registry. Path:
+             * NTC_SESSIONS_DB / sessions.db, else derived from the main DB so each
+             * deployment (and each isolated test) gets its own. */
+            char sdb[300] = "";
+            bool sf2 = false;
+            if (ntc_registry_get_config(g.reg, "sessions.db", sdb, sizeof sdb, &sf2) == NTC_OK && sf2) {}
+            const char *sde = getenv("NTC_SESSIONS_DB"); if (sde) snprintf(sdb, sizeof sdb, "%s", sde);
+            if (!sdb[0]) {
+                const char *mdb = getenv("NTC_DB"); if (!mdb) mdb = "ntc.db";
+                size_t ml = strlen(mdb);
+                if (ml > 3 && strcmp(mdb + ml - 3, ".db") == 0)
+                    snprintf(sdb, sizeof sdb, "%.*s.sessions.db", (int)(ml - 3), mdb);
+                else
+                    snprintf(sdb, sizeof sdb, "%s.sessions.db", mdb);
+            }
+            g.sessions = ntc_session_store_open(sdb);
+            if (!g.sessions) NTC_WARN("oauth: cannot open sessions DB '%s'; login disabled", sdb);
             g.oauth_pending = ntc_kv_new(1024);
             char ca[256] = ""; bool cf = false;
             if (ntc_registry_get_config(g.reg, "oauth.ca", ca, sizeof ca, &cf) == NTC_OK && cf) {}
@@ -2249,7 +2263,8 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
             g.oauth_ca = ca[0] ? ntc_ca_load_pem(ca) : ntc_ca_default();
             g.oauth_enabled = g.sessions && g.oauth_pending;
             if (g.oauth_enabled)
-                NTC_SUCCESS("oauth: login enabled (/auth/login -> %s)", g.oauth_authorize_url);
+                NTC_SUCCESS("oauth: login enabled (/auth/login -> %s, sessions in %s)",
+                            g.oauth_authorize_url, sdb);
             if (!g.oauth_ca)
                 NTC_WARN("oauth: no CA roots for the token endpoint (set oauth.ca); exchange will fail closed");
         }
@@ -2444,6 +2459,13 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
         }
         dev_tick(&g);
         supervise(&g);
+        if (g.sessions) { /* reap expired sessions periodically (every ~5 min) */
+            long tnow = now_ms();
+            if (g.sessions_last_sweep == 0 || tnow - g.sessions_last_sweep > 300000) {
+                (void)ntc_session_sweep(g.sessions, time(NULL));
+                g.sessions_last_sweep = tnow;
+            }
+        }
     }
 
     NTC_INFO("shutting down");
@@ -2467,7 +2489,7 @@ ntc_err ntc_server_run(uint16_t port, uint16_t admin_port, uint16_t tls_port,
     if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     if (g.control_fd >= 0) { close(g.control_fd); unlink(ntc_control_sock_path()); }
     ntc_mw_free(g.mw);
-    ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
+    ntc_session_store_close(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
     if (g.has_schemas) ntc_arena_destroy(&g.schema_arena);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);
@@ -2477,7 +2499,7 @@ fail_pre_poll:
     free(g.services);
     if (g.tls_conf) ntc_tls_conf_free(g.tls_conf);
     ntc_mw_free(g.mw);
-    ntc_kv_free(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
+    ntc_session_store_close(g.sessions); ntc_kv_free(g.oauth_pending); ntc_ca_free(g.oauth_ca);
     if (g.has_schemas) ntc_arena_destroy(&g.schema_arena);
     ntc_registry_close(g.reg);
     ntc_router_destroy(g.router);

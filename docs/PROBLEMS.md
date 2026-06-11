@@ -43,10 +43,14 @@ Wave-3 deep live test).
 
 ## M12 — OAuth2 login + sessions
 
-- **Sessions are in-memory** (a per-process TTL map), so they are lost on
-  restart and not shared across replicas. A SQLite-backed store would survive
-  restarts + scale across worker pools (M14). Eviction is soonest-expiry when
-  full.
+- ~~**Sessions are in-memory**, lost on restart.~~ **RESOLVED (2026-06-10):**
+  sessions are now SQLite-backed in their own DB (`src/core/session_store.c`,
+  `sessions.db` / `NTC_SESSIONS_DB`, default derived from `NTC_DB`); logins
+  survive a gateway restart (tested: `m12.session_survives_restart`). The PKCE
+  pending store stays in-memory on purpose (ephemeral). Still per-gateway: a
+  *multi-gateway* deployment would need a shared session DB (the future pluggable
+  data-plane covers it) — but a single gateway with worker-pool replicas already
+  shares sessions, since the gateway owns them.
 - **id_token validation is HS256-via-client-secret only** in this pass (valid
   per OIDC, and what the test mock uses). RS256/ES256 id_tokens should reuse the
   existing `auth.jwks_url` JWKS machinery (`ntc_jwt_verify_jwks`) - wire
