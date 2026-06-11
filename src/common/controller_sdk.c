@@ -26,6 +26,25 @@ int ntc_reply_json(ntc_response *res, ntc_arena *a, int status, const char *fmt,
     return 0;
 }
 
+int ntc_res_header(ntc_response *res, const char *name, const char *value) {
+    int n = snprintf(res->headers + res->headers_len, sizeof res->headers - res->headers_len,
+                     "%s: %s\r\n", name, value);
+    if (n < 0 || (size_t)n >= sizeof res->headers - res->headers_len) return -1;
+    res->headers_len += (size_t)n;
+    return 0;
+}
+
+int ntc_redirect(ntc_response *res, int status, const char *location) {
+    res->status = status;
+    res->content_type = NTC_SLICE_LIT("text/html; charset=utf-8");
+    res->body = NTC_SLICE_LIT("");
+    return ntc_res_header(res, "Location", location);
+}
+
+int ntc_set_cookie(ntc_response *res, const char *set_cookie_value) {
+    return ntc_res_header(res, "Set-Cookie", set_cookie_value);
+}
+
 #define NTC_CTL_MAX_PAYLOAD (256 * 1024)
 
 static int read_full(int fd, uint8_t *buf, size_t n) {
@@ -309,11 +328,13 @@ int ntc_controller_run(const ntc_controller *ctl) {
             res.body = NTC_SLICE_LIT("{\"error\":\"controller error\"}");
         }
 
-        size_t cap = res.body.len + res.content_type.len + 64;
+        size_t cap = res.body.len + res.content_type.len + res.headers_len + 80;
         uint8_t *out = ntc_arena_alloc(&a, cap);
         if (out) {
-            ssize_t pl = ntc_wire_encode_response(res.status, res.content_type,
-                                                  res.body, out, cap);
+            ssize_t pl = res.headers_len
+                ? ntc_wire_encode_response_ex(res.status, res.content_type, res.body,
+                                              ntc_slice_new(res.headers, res.headers_len), out, cap)
+                : ntc_wire_encode_response(res.status, res.content_type, res.body, out, cap);
             if (pl > 0)
                 (void)send_frame(fd, NTC_MSG_RESPONSE, h.request_id, out, (uint32_t)pl);
         }

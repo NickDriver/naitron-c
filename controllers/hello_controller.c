@@ -10,6 +10,14 @@
 
 static int handle(const ntc_request *req, ntc_response *res, ntc_arena *a, void *u) {
     (void)u;
+    /* ?redirect=<url> exercises controller-set headers (302 + Location + custom) */
+    ntc_slice rd = ntc_req_query(req, "redirect");
+    if (rd.len && rd.len < 240) {
+        char loc[256];
+        snprintf(loc, sizeof loc, "%.*s", (int)rd.len, rd.ptr);
+        ntc_res_header(res, "X-Test", "hello");
+        return ntc_redirect(res, 302, loc);
+    }
     ntc_slice name = ntc_req_param(req, "name");   /* path param :name  */
     ntc_slice sub = req->auth_sub;                 /* auth subject      */
     return ntc_reply_json(res, a, 200,

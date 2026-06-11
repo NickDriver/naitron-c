@@ -79,11 +79,21 @@ def _decode_request(p):
     }
 
 
-def _encode_response(status, content_type, body):
+def _encode_response(status, content_type, body, headers=None):
     if isinstance(body, str):
         body = body.encode()
     ct = content_type.encode()
-    return struct.pack(">HH", status, len(ct)) + ct + struct.pack(">I", len(body)) + body
+    out = struct.pack(">HH", status, len(ct)) + ct + struct.pack(">I", len(body)) + body
+    if headers:
+        items = headers.items() if isinstance(headers, dict) else headers
+        blob = "".join("%s: %s\r\n" % (k, v) for k, v in items).encode("latin1")
+        out += struct.pack(">H", len(blob)) + blob  # trailing header block (backward-compat)
+    return out
+
+
+def redirect(location, status=302):
+    """A handler can `return naitron.redirect("/")` to send a 302."""
+    return (status, "text/html; charset=utf-8", "", {"Location": location})
 
 
 class Stream:
@@ -163,8 +173,13 @@ def run(handler, name="controller", stream=False):
                 if st.begun and not st.ended:
                     st.end()
         else:
+            headers = None
             try:
-                status, ctype, body = handler(req)
+                res = handler(req)
+                if len(res) == 4:
+                    status, ctype, body, headers = res   # (status, ctype, body, headers)
+                else:
+                    status, ctype, body = res
             except Exception:
                 status, ctype, body = 500, "application/json", '{"error":"controller error"}'
-            _send_frame(fd, RESPONSE, rid, _encode_response(status, ctype, body))
+            _send_frame(fd, RESPONSE, rid, _encode_response(status, ctype, body, headers))

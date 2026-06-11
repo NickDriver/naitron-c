@@ -171,6 +171,28 @@ bool ntc_wire_decode_response(const uint8_t *buf, size_t len, int *status,
     return !r.err;
 }
 
+ssize_t ntc_wire_encode_response_ex(int status, ntc_slice ctype, ntc_slice body,
+                                    ntc_slice headers, uint8_t *out, size_t cap) {
+    wbuf w = { out, cap, 0, false };
+    w_u16(&w, (uint16_t)status);
+    w_slice16(&w, ctype);
+    w_u32(&w, (uint32_t)body.len);
+    w_bytes(&w, body.ptr, body.len);
+    w_slice16(&w, headers); /* trailing: u16 len + raw header bytes */
+    return w.err ? -1 : (ssize_t)w.off;
+}
+
+bool ntc_wire_decode_response_ex(const uint8_t *buf, size_t len, int *status,
+                                 ntc_slice *ctype, ntc_slice *body, ntc_slice *headers) {
+    rbuf r = { buf, len, 0, false };
+    *status = (int)r_u16(&r);
+    *ctype = r_slice16(&r);
+    *body = r_slice32(&r);
+    if (r.off < r.len) *headers = r_slice16(&r); /* present only on an _ex payload */
+    else *headers = ntc_slice_new(NULL, 0);
+    return !r.err;
+}
+
 /* ---- streaming payloads (v3) ---- */
 ssize_t ntc_wire_encode_response_begin(int status, uint8_t flags, ntc_slice ctype,
                                        uint8_t *out, size_t cap) {
@@ -311,6 +333,28 @@ TEST(wire, chunk_roundtrip) {
     ASSERT_TRUE(ntc_wire_decode_chunk(enc, (size_t)n, &data));
     ASSERT_EQ_UINT((unsigned)sizeof raw, (unsigned)data.len);
     ASSERT_TRUE(memcmp(data.ptr, raw, sizeof raw) == 0);
+}
+
+TEST(wire, response_headers_roundtrip) {
+    uint8_t enc[256];
+    const char *hdr = "Location: /x\r\nX-Test: 1\r\n";
+    ssize_t n = ntc_wire_encode_response_ex(302, NTC_SLICE_LIT("text/html"),
+                    NTC_SLICE_LIT(""), ntc_slice_cstr(hdr), enc, sizeof enc);
+    ASSERT_TRUE(n > 0);
+    int status; ntc_slice ct, body, headers;
+    ASSERT_TRUE(ntc_wire_decode_response_ex(enc, (size_t)n, &status, &ct, &body, &headers));
+    ASSERT_EQ_INT(302, status);
+    ASSERT_EQ_UINT((unsigned)strlen(hdr), (unsigned)headers.len);
+    ASSERT_TRUE(memcmp(headers.ptr, hdr, headers.len) == 0);
+
+    /* a plain (no-header) RESPONSE payload decodes via _ex with empty headers */
+    ssize_t pn = ntc_wire_encode_response(200, NTC_SLICE_LIT("application/json"),
+                                          NTC_SLICE_LIT("{}"), enc, sizeof enc);
+    ASSERT_TRUE(pn > 0);
+    ASSERT_TRUE(ntc_wire_decode_response_ex(enc, (size_t)pn, &status, &ct, &body, &headers));
+    ASSERT_EQ_INT(200, status);
+    ASSERT_EQ_UINT(0u, (unsigned)headers.len);
+    ASSERT_TRUE(ntc_slice_eq_cstr(body, "{}"));
 }
 
 TEST(wire, ws_msg_roundtrip) {

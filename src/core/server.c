@@ -443,12 +443,20 @@ static void gw_deliver(gateway *g, uint32_t id, const uint8_t *payload, size_t l
     gw_free_slot(g, (uint16_t)(id & NTC_INFLIGHT_MASK));
     c->inflight = false;
 
-    int status; ntc_slice ctype, body;
-    if (!ntc_wire_decode_response(payload, len, &status, &ctype, &body)) {
+    int status; ntc_slice ctype, body, hdrs;
+    if (!ntc_wire_decode_response_ex(payload, len, &status, &ctype, &body, &hdrs)) {
         (void)respond_and_flush(g, c, 502, NTC_SLICE_LIT("{\"error\":\"bad upstream response\"}"));
         return;
     }
     rec_status(g, status);
+    /* merge controller-set headers (Location, Set-Cookie, ...) into the response */
+    if (hdrs.len) {
+        size_t el = strlen(c->extra_headers);
+        size_t room = sizeof c->extra_headers - el;
+        size_t take = hdrs.len < room - 1 ? hdrs.len : (room > 0 ? room - 1 : 0);
+        memcpy(c->extra_headers + el, hdrs.ptr, take);
+        c->extra_headers[el + take] = '\0';
+    }
     if (conn_respond(c, status, ctype, body) != 0) { conn_close(g, c); return; }
     (void)conn_flush(g, c);
 }

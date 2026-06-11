@@ -70,6 +70,15 @@ bool ntc_wire_decode_request(const uint8_t *buf, size_t len, ntc_request *req);
 bool ntc_wire_decode_response(const uint8_t *buf, size_t len, int *status,
                               ntc_slice *ctype, ntc_slice *body);
 
+/* RESPONSE with controller-set headers (a raw "Name: Value\r\n..." blob appended
+ * after the body). Backward-compatible: a decoder that stops after the body
+ * simply ignores the trailing blob, and decode_response_ex returns an empty
+ * headers slice for a plain (no-trailer) payload. */
+ssize_t ntc_wire_encode_response_ex(int status, ntc_slice ctype, ntc_slice body,
+                                    ntc_slice headers, uint8_t *out, size_t cap);
+bool ntc_wire_decode_response_ex(const uint8_t *buf, size_t len, int *status,
+                                 ntc_slice *ctype, ntc_slice *body, ntc_slice *headers);
+
 /* Streaming (v3). BEGIN carries status + flags + content-type; CHUNK carries an
  * opaque body slice (gateway frames it per the flags); END has an empty payload
  * (no encode/decode needed - just a header with length 0). */

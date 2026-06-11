@@ -54,6 +54,13 @@ int ntc_controller_run(const ntc_controller *ctl);
 __attribute__((format(printf, 4, 5)))
 int ntc_reply_json(ntc_response *res, ntc_arena *a, int status, const char *fmt, ...);
 
+/* ---- response headers (atomic handlers) ----
+ * Set an arbitrary response header, redirect, or set a cookie. Each returns 0,
+ * or -1 if the header buffer is full. */
+int ntc_res_header(ntc_response *res, const char *name, const char *value);
+int ntc_redirect(ntc_response *res, int status, const char *location); /* status + Location, empty body */
+int ntc_set_cookie(ntc_response *res, const char *set_cookie_value);    /* raw Set-Cookie value */
+
 /* ---- streaming response API (used from an ntc_stream_fn handler) ----
  * Begin once, then write/sse_send zero or more times, then end (auto-called at
  * handler return if omitted). Each returns 0 on success, -1 on a write error

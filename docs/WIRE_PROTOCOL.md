@@ -64,7 +64,15 @@ u32 len + bytes   body
 u16               status
 u16 len + bytes   content_type
 u32 len + bytes   body
+u16 len + bytes   headers      (optional trailing block; raw "Name: Value\r\n" lines)
 ```
+
+The trailing `headers` block lets a controller set arbitrary response headers
+(Location for a redirect, Set-Cookie, Cache-Control, ...). It is **backward
+compatible**: a reader that stops after `body` simply ignores it, and a payload
+written without headers has no trailing block (decoders report an empty header
+slice). Set via the SDK's `ntc_res_header` / `ntc_redirect` / `ntc_set_cookie`
+(C) or by returning a 4-tuple / `naitron.redirect()` (Python).
 
 ## Streaming responses (v3)
 

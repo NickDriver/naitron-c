@@ -45,6 +45,8 @@ typedef struct ntc_response {
     int status;
     ntc_slice content_type;
     ntc_slice body;
+    char headers[512];   /* raw "Name: Value\r\n" lines, set via ntc_res_header() */
+    size_t headers_len;
 } ntc_response;
 
 /* Parse a request from buf[0..len). Slices point into buf (zero-copy), so buf
